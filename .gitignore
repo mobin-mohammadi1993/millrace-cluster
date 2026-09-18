@@ -1,0 +1,6 @@
+/millrace-cluster
+/millrace-cluster.exe
+*.exe
+*.test
+/data/
+/compose-data/

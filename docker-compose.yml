@@ -1,0 +1,43 @@
+version: "3.9"
+
+# A real 3-node Raft cluster. Each node is the same image; only --node-id
+# and --raft-addr (bound to this container's own hostname, so peers can
+# dial it back over the compose network) differ. All three get the
+# identical --peers list up front (static bootstrap membership -- see
+# README's "honest limitations").
+services:
+  n1:
+    build: .
+    hostname: n1
+    command:
+      - --node-id=n1
+      - --raft-addr=n1:7000
+      - --grpc-addr=0.0.0.0:8000
+      - --data-dir=/data
+      - --peers=n1=n1:7000,n2=n2:7000,n3=n3:7000
+    ports:
+      - "8001:8000"
+
+  n2:
+    build: .
+    hostname: n2
+    command:
+      - --node-id=n2
+      - --raft-addr=n2:7000
+      - --grpc-addr=0.0.0.0:8000
+      - --data-dir=/data
+      - --peers=n1=n1:7000,n2=n2:7000,n3=n3:7000
+    ports:
+      - "8002:8000"
+
+  n3:
+    build: .
+    hostname: n3
+    command:
+      - --node-id=n3
+      - --raft-addr=n3:7000
+      - --grpc-addr=0.0.0.0:8000
+      - --data-dir=/data
+      - --peers=n1=n1:7000,n2=n2:7000,n3=n3:7000
+    ports:
+      - "8003:8000"

@@ -1,0 +1,46 @@
+syntax = "proto3";
+
+package control;
+
+option go_package = "millrace-cluster/internal/controlpb";
+
+// Control is the cluster's gRPC control plane: cluster-aware topic
+// creation (partition placement) and read-only cluster/topic inspection.
+// Raft-level consensus (leader election, log replication) is not exposed
+// here directly -- this is the application API built on top of it.
+service Control {
+  rpc CreateTopic(CreateTopicRequest) returns (CreateTopicResponse);
+  rpc ClusterState(ClusterStateRequest) returns (ClusterStateResponse);
+}
+
+message CreateTopicRequest {
+  string name = 1;
+  uint32 num_partitions = 2;
+}
+
+message CreateTopicResponse {
+  bool ok = 1;
+  // Set when ok is false: either a validation error, or "not leader" with
+  // the current leader's raft address, so a caller can retry there.
+  string error = 2;
+  TopicInfo topic = 3;
+}
+
+message PartitionAssignment {
+  uint32 partition = 1;
+  string node_id = 2;
+}
+
+message TopicInfo {
+  string name = 1;
+  repeated PartitionAssignment partitions = 2;
+}
+
+message ClusterStateRequest {}
+
+message ClusterStateResponse {
+  // Raft node ID of the current leader, as seen by the node that answered
+  // this RPC; empty if that node doesn't currently know of a leader.
+  string leader_id = 1;
+  repeated TopicInfo topics = 2;
+}
