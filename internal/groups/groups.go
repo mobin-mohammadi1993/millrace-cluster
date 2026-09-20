@@ -6,8 +6,9 @@
 // resume from their commits.
 //
 // ponytail: groups are never deleted once created (a leak only if group names
-// are unbounded), and there is no commit fencing by generation, so a member
-// that has been evicted but keeps running can still overwrite a commit.
+// are unbounded). Commit fencing (Authorize) applies only to commits routed
+// through the coordinator; brokers know nothing about membership, so a client
+// that commits to a broker directly is not fenced.
 package groups
 
 import (
@@ -19,7 +20,10 @@ import (
 	"time"
 )
 
-var ErrUnknownMember = errors.New("unknown member: rejoin")
+var (
+	ErrUnknownMember = errors.New("unknown member: rejoin")
+	ErrNotAssigned   = errors.New("fenced: partition is not assigned to this member")
+)
 
 // State is what a member is told: who it is, the group's current generation
 // (bumped on every membership change), and the partitions it should consume.
@@ -146,6 +150,25 @@ func (c *Coordinator) Heartbeat(topic, name, member string, partitions int) (Sta
 	}
 	g.seen[member] = c.now()
 	return State{member, g.generation, assignment(g, member, partitions)}, nil
+}
+
+// Authorize is the fence for commits: only a live member that is *currently*
+// assigned the partition may commit it. An evicted member is unknown; a member
+// whose partition was rebalanced away gets ErrNotAssigned even if it hasn't
+// noticed yet. (It does not refresh the session -- only heartbeats do.)
+func (c *Coordinator) Authorize(topic, name, member string, partition uint32, partitions int) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	g := c.group(topic, name)
+	if _, ok := g.seen[member]; !ok {
+		return ErrUnknownMember
+	}
+	for _, p := range assignment(g, member, partitions) {
+		if p == partition {
+			return nil
+		}
+	}
+	return ErrNotAssigned
 }
 
 func (c *Coordinator) Leave(topic, name, member string) {

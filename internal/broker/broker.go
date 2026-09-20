@@ -72,6 +72,18 @@ func CreateTopicOwned(addr, name string, partitions uint32, owned []uint32) erro
 	return createErr(roundTrip(addr, body))
 }
 
+// CommitOffset records a consumer group's committed offset on the broker that
+// owns the partition (the broker rejects an offset past the end of the log).
+func CommitOffset(addr, topic string, partition uint32, group string, offset uint64) error {
+	body := nameBody(6, topic)
+	body = binary.LittleEndian.AppendUint32(body, partition)
+	body = binary.LittleEndian.AppendUint16(body, uint16(len(group)))
+	body = append(body, group...)
+	body = binary.LittleEndian.AppendUint64(body, offset)
+	_, err := roundTrip(addr, body)
+	return err
+}
+
 func createErr(_ []byte, err error) error {
 	if err != nil && err.Error() == ErrExists.Error() {
 		return ErrExists

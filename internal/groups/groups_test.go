@@ -108,6 +108,53 @@ func TestDescribeListsLiveGroupsOfOneTopic(t *testing.T) {
 	}
 }
 
+func TestAuthorizeFencesCommits(t *testing.T) {
+	c := New(10 * time.Second)
+	now := fakeClock(c)
+	const parts = 4
+
+	a := c.Join("t", "g", "", parts) // alone: owns 0..3
+	for p := uint32(0); p < parts; p++ {
+		if err := c.Authorize("t", "g", a.Member, p, parts); err != nil {
+			t.Fatalf("sole owner refused on partition %d: %v", p, err)
+		}
+	}
+	if err := c.Authorize("t", "g", "stranger", 0, parts); err != ErrUnknownMember {
+		t.Fatalf("non-member: %v", err)
+	}
+
+	// B joins: A keeps 0,2 and B gets 1,3. A hasn't heartbeated, but the
+	// coordinator already refuses A's commits for partitions it lost.
+	b := c.Join("t", "g", "", parts)
+	for p, want := range map[uint32]error{0: nil, 2: nil, 1: ErrNotAssigned, 3: ErrNotAssigned} {
+		if err := c.Authorize("t", "g", a.Member, p, parts); err != want {
+			t.Errorf("A on partition %d: got %v, want %v", p, err, want)
+		}
+	}
+	if err := c.Authorize("t", "g", b.Member, 1, parts); err != nil {
+		t.Errorf("B on its own partition: %v", err)
+	}
+
+	// B goes silent and is evicted (A keeps heartbeating): B is now a stranger,
+	// and A owns everything again.
+	*now = now.Add(6 * time.Second)
+	c.Heartbeat("t", "g", a.Member, parts)
+	*now = now.Add(6 * time.Second)
+	c.Heartbeat("t", "g", a.Member, parts)
+	if err := c.Authorize("t", "g", b.Member, 1, parts); err != ErrUnknownMember {
+		t.Errorf("evicted member: %v", err)
+	}
+	if err := c.Authorize("t", "g", a.Member, 1, parts); err != nil {
+		t.Errorf("A after taking over: %v", err)
+	}
+
+	// Authorize alone does not keep a member alive.
+	*now = now.Add(11 * time.Second)
+	if err := c.Authorize("t", "g", a.Member, 0, parts); err != ErrUnknownMember {
+		t.Errorf("silent member should time out even if it only commits: %v", err)
+	}
+}
+
 func TestMoreMembersThanPartitions(t *testing.T) {
 	c := New(time.Minute)
 	fakeClock(c)

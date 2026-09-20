@@ -67,6 +67,10 @@ reaching for "implement everything from scratch" as the portfolio flex.
   /groups?topic=T` lists the topic's groups that have live members — each
   group's generation and every member's partitions — which is what
   `millrace-cli groups` and the dashboard's members table show.
+  `POST /groups/commit` is the **fence**: it forwards a commit to the
+  partition's broker only if the member is alive *and* the partition is
+  currently assigned to it, answering 404 (evicted: re-join) or 403 (no longer
+  yours) otherwise.
 
 ## Honest limitations (current state)
 
@@ -74,10 +78,17 @@ reaching for "implement everything from scratch" as the portfolio flex.
   replicated (they'd swamp the log). After a leader change the new leader
   knows no members, so each gets 404, re-joins under its old id and resumes
   from its broker-side commits — a brief rebalance, no lost progress, but
-  possible re-delivery. There is no fencing by generation (an evicted member
-  that keeps running can still overwrite a commit), groups are never
-  garbage-collected, and assignment is plain round-robin (no stickiness, so a
-  membership change can move more partitions than necessary).
+  possible re-delivery. Groups are never garbage-collected, and assignment is
+  plain round-robin (no stickiness, so a membership change can move more
+  partitions than necessary).
+- **Commit fencing has limits.** It covers commits sent through
+  `POST /groups/commit` (what `GroupConsumer` uses); brokers know nothing about
+  membership, so a client that commits to a broker directly (`Consumer(group=…)`,
+  `millrace-cli commit`) is not fenced. The check and the forward to the broker
+  are not atomic, so an eviction in that instant can still let one commit
+  through. Every fenced commit takes an extra hop through the leader. There is
+  no per-generation check — the invariant enforced is "only the partition's
+  current owner may commit".
 
 - **Static membership.** The cluster's node set is fixed at bootstrap via
   `--peers`, identical on every node. There's no `Join`/`Leave` RPC and no
@@ -161,7 +172,9 @@ rejects both a fetch and a produce for that partition ("not owned").
 `internal/groups/groups_test.go` unit-tests the coordinator on a fake clock:
 generation bumps, exact round-robin splits, eviction after the timeout,
 re-join under the old id, leave, group/topic isolation, more members than
-partitions, and `Describe` (only groups with live members, sorted, one topic). The whole group flow is tested end to end from `millrace-sdk`
+partitions, `Describe` (only groups with live members, sorted, one topic), and
+`Authorize` (owner allowed; stranger, evicted member and a partition lost to a
+rebalance all refused; a commit alone doesn't keep a session alive). The whole group flow is tested end to end from `millrace-sdk`
 (`test_consumer_group_splits_partitions_and_rebalances`) against three real
 cluster processes and three real brokers — see that README.
 

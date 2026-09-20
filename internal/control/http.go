@@ -2,12 +2,15 @@ package control
 
 import (
 	"encoding/json"
+	"errors"
 	"net/http"
 	"strconv"
 
 	"github.com/hashicorp/raft"
 
+	"millrace-cluster/internal/broker"
 	pb "millrace-cluster/internal/controlpb"
+	"millrace-cluster/internal/groups"
 )
 
 // HTTPHandler is a stdlib-only JSON face for clients that shouldn't need a
@@ -20,6 +23,9 @@ import (
 //	     (groups with live members only; leader only, 409 otherwise)
 //	POST /groups/{join,heartbeat,leave} {"topic","group","member"} -> {"member","generation","partitions"}
 //	     (leader only, 409 otherwise; heartbeat of an unknown member is 404: re-join)
+//	POST /groups/commit {"topic","group","member","partition","offset"} -> {}
+//	     fenced: 404 if the member is unknown (evicted: re-join), 403 if the partition
+//	     is not currently assigned to it; otherwise forwarded to the owning broker
 func (s *Server) HTTPHandler() http.Handler {
 	mux := http.NewServeMux()
 
@@ -85,9 +91,11 @@ func (s *Server) HTTPHandler() http.Handler {
 			return
 		}
 		var body struct {
-			Topic  string `json:"topic"`
-			Group  string `json:"group"`
-			Member string `json:"member"`
+			Topic     string `json:"topic"`
+			Group     string `json:"group"`
+			Member    string `json:"member"`
+			Partition uint32 `json:"partition"` // commit only
+			Offset    uint64 `json:"offset"`    // commit only
 		}
 		if err := json.NewDecoder(r.Body).Decode(&body); err != nil || body.Group == "" {
 			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "need JSON {topic, group, member?}"})
@@ -109,6 +117,32 @@ func (s *Server) HTTPHandler() http.Handler {
 				return
 			}
 			writeJSON(w, http.StatusOK, st)
+		case "commit":
+			// Fenced commit: forwarded to the partition's broker only if this
+			// member is alive and currently owns the partition. (Check-then-forward
+			// is not atomic: an eviction in that instant can still slip one through.)
+			if int(body.Partition) >= n {
+				writeJSON(w, http.StatusBadRequest, map[string]string{"error": "unknown partition"})
+				return
+			}
+			switch err := s.Groups.Authorize(body.Topic, body.Group, body.Member, body.Partition, n); {
+			case errors.Is(err, groups.ErrUnknownMember):
+				writeJSON(w, http.StatusNotFound, map[string]string{"error": err.Error()})
+				return
+			case err != nil: // groups.ErrNotAssigned
+				writeJSON(w, http.StatusForbidden, map[string]string{"error": err.Error()})
+				return
+			}
+			addr, ok := s.Brokers[t.Partitions[body.Partition].NodeID]
+			if !ok {
+				writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "no broker configured for the partition's node"})
+				return
+			}
+			if err := broker.CommitOffset(addr, body.Topic, body.Partition, body.Group, body.Offset); err != nil {
+				writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+				return
+			}
+			writeJSON(w, http.StatusOK, map[string]string{})
 		case "leave":
 			s.Groups.Leave(body.Topic, body.Group, body.Member)
 			writeJSON(w, http.StatusOK, map[string]string{})
