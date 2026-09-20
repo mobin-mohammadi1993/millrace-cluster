@@ -17,6 +17,9 @@ type Server struct {
 	pb.UnimplementedControlServer
 	Raft *raft.Raft
 	FSM  *fsm.FSM
+	// Brokers maps node ID -> that node's millrace-core address (static,
+	// identical on every node), used to answer routing lookups.
+	Brokers map[string]string
 }
 
 func (s *Server) CreateTopic(ctx context.Context, req *pb.CreateTopicRequest) (*pb.CreateTopicResponse, error) {

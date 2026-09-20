@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log"
 	"net"
+	"net/http"
 	"sort"
 	"strings"
 
@@ -27,7 +28,9 @@ func main() {
 	dataDir := flag.String("data-dir", "data", "raft snapshot data directory")
 	peersFlag := flag.String("peers", "", "comma-separated id=raft_addr list for the full static cluster "+
 		"(same on every node), e.g. n1=127.0.0.1:7000,n2=127.0.0.1:7001,n3=127.0.0.1:7002 (required)")
-	brokerAddr := flag.String("broker-addr", "", "optional millrace-core address; topics committed to the cluster are created on it")
+	brokersFlag := flag.String("brokers", "", "optional id=millrace-core_addr list, same on every node: "+
+		"committed topics are created on this node's own broker, and /route answers with these addresses")
+	httpAddr := flag.String("http-addr", "", "optional listen address for the JSON routing/topics API")
 	flag.Parse()
 
 	if *nodeID == "" || *peersFlag == "" {
@@ -39,9 +42,20 @@ func main() {
 		log.Fatalf("parsing --peers: %v", err)
 	}
 
+	brokers := map[string]string{}
+	if *brokersFlag != "" {
+		for _, p := range strings.Split(*brokersFlag, ",") {
+			kv := strings.SplitN(strings.TrimSpace(p), "=", 2)
+			if len(kv) != 2 {
+				log.Fatalf("invalid --brokers entry %q, want id=addr", p)
+			}
+			brokers[kv[0]] = kv[1]
+		}
+	}
+
 	f := fsm.New(peerIDs)
-	if *brokerAddr != "" {
-		f.OnTopicCreated = broker.Mirror(*brokerAddr)
+	if own, ok := brokers[*nodeID]; ok {
+		f.OnTopicCreated = broker.Mirror(own)
 	}
 
 	r, err := raftnode.Start(f, raftnode.Config{
@@ -59,7 +73,11 @@ func main() {
 		log.Fatalf("listening on %s: %v", *grpcAddr, err)
 	}
 	grpcServer := grpc.NewServer()
-	pb.RegisterControlServer(grpcServer, &control.Server{Raft: r, FSM: f})
+	srv := &control.Server{Raft: r, FSM: f, Brokers: brokers}
+	pb.RegisterControlServer(grpcServer, srv)
+	if *httpAddr != "" {
+		go func() { log.Fatalf("http serve: %v", http.ListenAndServe(*httpAddr, srv.HTTPHandler())) }()
+	}
 
 	log.Printf("millrace-cluster node %q ready: raft=%s grpc=%s peers=%v", *nodeID, *raftAddr, *grpcAddr, peerIDs)
 	if err := grpcServer.Serve(lis); err != nil {

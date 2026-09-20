@@ -82,6 +82,13 @@ func (f *FSM) applyCreateTopic(c *CreateTopicCommand) interface{} {
 	return topic
 }
 
+func (f *FSM) Topic(name string) (TopicInfo, bool) {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+	t, ok := f.topics[name]
+	return t, ok
+}
+
 // ListTopics is a direct (non-Raft-log) read of this node's current state.
 // Safe to call on a follower, which may briefly lag the leader -- same
 // caveat as any Raft read that isn't routed through the log.

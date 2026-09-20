@@ -47,7 +47,14 @@ reaching for "implement everything from scratch" as the portfolio flex.
   `DescribeTopic`) and `Mirror`, the FSM hook that creates committed topics on
   the node's local broker.
 - **`cmd/millrace-cluster`** — the node binary: `--node-id`, `--raft-addr`,
-  `--grpc-addr`, `--data-dir`, `--peers`, optional `--broker-addr`.
+  `--grpc-addr`, `--data-dir`, `--peers`, plus optional `--brokers`
+  (`id=millrace-core_addr`, same on every node) and `--http-addr`.
+- **`internal/control/http.go`** — a stdlib-only JSON API for clients that
+  shouldn't need gRPC: `GET /route?topic=T&partition=P` →
+  `{"node_id","broker_addr"}` (any node can answer), and `POST /topics`
+  (leader only; a follower answers 409 "not leader", so try another node).
+  `millrace-sdk`'s `RoutedClient` uses it to send each produce/fetch to the
+  broker that owns the partition.
 
 ## Honest limitations (current state)
 
@@ -63,13 +70,15 @@ reaching for "implement everything from scratch" as the portfolio flex.
   (`raft-boltdb`) are a documented fast-follow, not implemented here.
 - **No auth/TLS** on either the Raft transport or the gRPC control plane —
   matches the trusted-network scope of `millrace-core` at this stage.
-- **Cluster ↔ broker wiring is only half-way.** With `--broker-addr`, every
-  node creates each committed topic on its own local `millrace-core`
-  (`internal/broker`, hooked into the FSM). But: every node's broker gets *all*
-  partitions of the topic (core has no "own only partitions 0 and 3"), nothing
-  routes or enforces that clients produce to the assigned node, mirroring is
-  async and not retried if the broker is down, and topics restored from a
-  Raft snapshot are not re-mirrored. The Compose file doesn't run brokers yet.
+- **Routing is advisory, not enforced.** With `--brokers`, every node creates
+  each committed topic on its own local `millrace-core`, and `/route` tells
+  clients which broker owns each partition. But every broker holds *all*
+  partitions of the topic (core has no "own only partitions 0 and 3") and will
+  accept a produce for any of them — a client that skips the router can write
+  to the wrong broker. Mirroring is async and not retried if a broker is down,
+  so a produce right after `POST /topics` can briefly fail with "unknown
+  topic"; topics restored from a Raft snapshot are not re-mirrored. Routes are
+  static (no rebalancing), and the Compose file doesn't run brokers yet.
 
 ## Running a 3-node cluster
 
@@ -119,7 +128,10 @@ repo's tuned (sub-second) timeouts.
 nodes, each with its own **real compiled `millrace-core` subprocess** (built
 in `../millrace-core`; the test skips if it isn't), commit a `CreateTopic`
 through Raft and assert it appears — with the right partition count — on
-all three brokers.
+all three brokers. The HTTP routing API is tested end to end from
+`millrace-sdk` (`tests/test_cluster.py`): three real cluster processes + three
+real brokers, records produced through `RoutedClient`, then every broker
+queried directly to prove each record exists only on its partition's owner.
 
 ## Wire/API formats
 
