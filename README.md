@@ -70,15 +70,18 @@ reaching for "implement everything from scratch" as the portfolio flex.
   (`raft-boltdb`) are a documented fast-follow, not implemented here.
 - **No auth/TLS** on either the Raft transport or the gRPC control plane —
   matches the trusted-network scope of `millrace-core` at this stage.
-- **Routing is advisory, not enforced.** With `--brokers`, every node creates
-  each committed topic on its own local `millrace-core`, and `/route` tells
-  clients which broker owns each partition. But every broker holds *all*
-  partitions of the topic (core has no "own only partitions 0 and 3") and will
-  accept a produce for any of them — a client that skips the router can write
-  to the wrong broker. Mirroring is async and not retried if a broker is down,
-  so a produce right after `POST /topics` can briefly fail with "unknown
-  topic"; topics restored from a Raft snapshot are not re-mirrored. Routes are
-  static (no rebalancing), and the Compose file doesn't run brokers yet.
+- **Ownership is fixed at topic creation.** With `--brokers`, every node
+  creates each committed topic on its own local `millrace-core` via
+  `CreateTopicOwned`, listing only the partitions the FSM assigned to it; the
+  broker then rejects produce/fetch for the rest, and `/route` tells clients
+  where each partition lives. There is no rebalancing: moving a partition
+  means a new assignment plus data movement, neither of which exists. A broker
+  with no `--brokers` entry (or a topic made with plain `CreateTopic` directly
+  on it) still serves everything. Unowned partitions still preallocate a
+  segment on every broker. Mirroring is async and not retried if a broker is
+  down, so a produce right after `POST /topics` can briefly fail with
+  "unknown topic"; topics restored from a Raft snapshot are not re-mirrored;
+  the Compose file doesn't run brokers yet.
 
 ## Running a 3-node cluster
 
@@ -130,8 +133,9 @@ in `../millrace-core`; the test skips if it isn't), commit a `CreateTopic`
 through Raft and assert it appears — with the right partition count — on
 all three brokers. The HTTP routing API is tested end to end from
 `millrace-sdk` (`tests/test_cluster.py`): three real cluster processes + three
-real brokers, records produced through `RoutedClient`, then every broker
-queried directly to prove each record exists only on its partition's owner.
+real brokers, records produced through `RoutedClient`; then every broker is
+queried directly, asserting the owner has the record and every other broker
+rejects both a fetch and a produce for that partition ("not owned").
 
 ## Wire/API formats
 

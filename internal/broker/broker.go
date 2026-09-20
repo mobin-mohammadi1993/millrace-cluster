@@ -52,11 +52,27 @@ func nameBody(op byte, name string) []byte {
 	return append(body, name...)
 }
 
-// CreateTopic returns ErrExists if the broker already has the topic.
+// CreateTopic makes the broker serve every partition of the topic; use
+// CreateTopicOwned to restrict it. Returns ErrExists if the topic exists.
 func CreateTopic(addr, name string, partitions uint32) error {
 	body := nameBody(1, name)
 	body = binary.LittleEndian.AppendUint32(body, partitions)
-	_, err := roundTrip(addr, body)
+	return createErr(roundTrip(addr, body))
+}
+
+// CreateTopicOwned makes the broker serve, and accept writes for, only the
+// listed partitions (op 5).
+func CreateTopicOwned(addr, name string, partitions uint32, owned []uint32) error {
+	body := nameBody(5, name)
+	body = binary.LittleEndian.AppendUint32(body, partitions)
+	body = binary.LittleEndian.AppendUint32(body, uint32(len(owned)))
+	for _, p := range owned {
+		body = binary.LittleEndian.AppendUint32(body, p)
+	}
+	return createErr(roundTrip(addr, body))
+}
+
+func createErr(_ []byte, err error) error {
 	if err != nil && err.Error() == ErrExists.Error() {
 		return ErrExists
 	}
@@ -73,10 +89,17 @@ func DescribeTopic(addr, name string) (int, error) {
 }
 
 // Mirror returns an fsm.FSM.OnTopicCreated hook that creates each committed
-// topic on the broker at addr. Runs async so a dead broker can't stall Raft.
-func Mirror(addr string) func(fsm.TopicInfo) {
+// topic on the broker at addr, owning only the partitions the FSM assigned to
+// nodeID. Runs async so a dead broker can't stall Raft.
+func Mirror(addr, nodeID string) func(fsm.TopicInfo) {
 	return func(t fsm.TopicInfo) {
-		err := CreateTopic(addr, t.Name, uint32(len(t.Partitions)))
+		owned := []uint32{}
+		for _, p := range t.Partitions {
+			if p.NodeID == nodeID {
+				owned = append(owned, p.Partition)
+			}
+		}
+		err := CreateTopicOwned(addr, t.Name, uint32(len(t.Partitions)), owned)
 		if err != nil && !errors.Is(err, ErrExists) {
 			log.Printf("broker %s: mirroring topic %q failed (not retried): %v", addr, t.Name, err)
 		}

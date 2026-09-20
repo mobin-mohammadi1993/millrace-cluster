@@ -55,7 +55,7 @@ func main() {
 
 	f := fsm.New(peerIDs)
 	if own, ok := brokers[*nodeID]; ok {
-		f.OnTopicCreated = broker.Mirror(own)
+		f.OnTopicCreated = broker.Mirror(own, *nodeID)
 	}
 
 	r, err := raftnode.Start(f, raftnode.Config{
