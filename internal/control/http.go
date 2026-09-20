@@ -11,7 +11,7 @@ import (
 // HTTPHandler is a stdlib-only JSON face for clients that shouldn't need a
 // gRPC stack just to ask "where does this partition live?".
 //
-//	GET  /route?topic=T&partition=P  -> {"node_id": ..., "broker_addr": ...}
+//	GET  /route?topic=T&partition=P  -> {"node_id": ..., "broker_addr": ..., "partitions": <count in T>}
 //	POST /topics {"name":..,"partitions":N} -> 201, or 409 {"error": ...}
 //	     (409 includes "not leader" -- POST to another node)
 func (s *Server) HTTPHandler() http.Handler {
@@ -35,7 +35,7 @@ func (s *Server) HTTPHandler() http.Handler {
 			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "no broker configured for node " + node})
 			return
 		}
-		writeJSON(w, http.StatusOK, map[string]string{"node_id": node, "broker_addr": addr})
+		writeJSON(w, http.StatusOK, map[string]any{"node_id": node, "broker_addr": addr, "partitions": len(t.Partitions)})
 	})
 
 	mux.HandleFunc("POST /topics", func(w http.ResponseWriter, r *http.Request) {

@@ -52,7 +52,7 @@ reaching for "implement everything from scratch" as the portfolio flex.
   (`id=millrace-core_addr`, same on every node) and `--http-addr`.
 - **`internal/control/http.go`** — a stdlib-only JSON API for clients that
   shouldn't need gRPC: `GET /route?topic=T&partition=P` →
-  `{"node_id","broker_addr"}` (any node can answer), and `POST /topics`
+  `{"node_id","broker_addr","partitions"}` (any node can answer; `partitions` is the topic's partition count), and `POST /topics`
   (leader only; a follower answers 409 "not leader", so try another node).
   `millrace-sdk`'s `RoutedClient` uses it to send each produce/fetch to the
   broker that owns the partition.
