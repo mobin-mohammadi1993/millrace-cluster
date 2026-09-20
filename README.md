@@ -43,8 +43,11 @@ reaching for "implement everything from scratch" as the portfolio flex.
   service: `CreateTopic` (routes through `raft.Apply`, rejecting with a
   "not leader" error plus the current leader's raft address if called on a
   follower) and `ClusterState` (a direct FSM read).
+- **`internal/broker`** — a minimal `millrace-core` client (`CreateTopic`,
+  `DescribeTopic`) and `Mirror`, the FSM hook that creates committed topics on
+  the node's local broker.
 - **`cmd/millrace-cluster`** — the node binary: `--node-id`, `--raft-addr`,
-  `--grpc-addr`, `--data-dir`, `--peers`.
+  `--grpc-addr`, `--data-dir`, `--peers`, optional `--broker-addr`.
 
 ## Honest limitations (current state)
 
@@ -60,9 +63,13 @@ reaching for "implement everything from scratch" as the portfolio flex.
   (`raft-boltdb`) are a documented fast-follow, not implemented here.
 - **No auth/TLS** on either the Raft transport or the gRPC control plane —
   matches the trusted-network scope of `millrace-core` at this stage.
-- `millrace-cluster` does not yet talk to `millrace-core` brokers to
-  actually place partition *data* — it decides and records assignment,
-  but wiring that decision into real broker instances is not built yet.
+- **Cluster ↔ broker wiring is only half-way.** With `--broker-addr`, every
+  node creates each committed topic on its own local `millrace-core`
+  (`internal/broker`, hooked into the FSM). But: every node's broker gets *all*
+  partitions of the topic (core has no "own only partitions 0 and 3"), nothing
+  routes or enforces that clients produce to the assigned node, mirroring is
+  async and not retried if the broker is down, and topics restored from a
+  Raft snapshot are not re-mirrored. The Compose file doesn't run brokers yet.
 
 ## Running a 3-node cluster
 
@@ -104,9 +111,15 @@ replicates to every node, then **kills the leader process's Raft instance**
 and confirms the two survivors elect a new leader and keep accepting and
 replicating writes.
 
-Last real run: `ok millrace-cluster/internal/raftnode 1.022s` — leader
+Last real run: `ok millrace-cluster/internal/raftnode 1.684s` — leader
 elected in ~200ms, failover re-election in ~130ms, both within this
 repo's tuned (sub-second) timeouts.
+
+`internal/raftnode/wired_test.go` covers the broker wiring: three real Raft
+nodes, each with its own **real compiled `millrace-core` subprocess** (built
+in `../millrace-core`; the test skips if it isn't), commit a `CreateTopic`
+through Raft and assert it appears — with the right partition count — on
+all three brokers.
 
 ## Wire/API formats
 

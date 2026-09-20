@@ -31,6 +31,11 @@ type FSM struct {
 	mu      sync.RWMutex
 	nodeIDs []string
 	topics  map[string]TopicInfo
+
+	// OnTopicCreated, if set before the node starts, is called (in its own
+	// goroutine) each time a CreateTopic is applied on this node. Not called
+	// for topics restored from a snapshot.
+	OnTopicCreated func(TopicInfo)
 }
 
 func New(nodeIDs []string) *FSM {
@@ -71,6 +76,9 @@ func (f *FSM) applyCreateTopic(c *CreateTopicCommand) interface{} {
 	}
 	topic := TopicInfo{Name: c.Name, Partitions: partitions}
 	f.topics[c.Name] = topic
+	if f.OnTopicCreated != nil {
+		go f.OnTopicCreated(topic)
+	}
 	return topic
 }
 

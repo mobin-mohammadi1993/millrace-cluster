@@ -13,6 +13,7 @@ import (
 	"github.com/hashicorp/raft"
 	"google.golang.org/grpc"
 
+	"millrace-cluster/internal/broker"
 	"millrace-cluster/internal/control"
 	pb "millrace-cluster/internal/controlpb"
 	"millrace-cluster/internal/fsm"
@@ -26,6 +27,7 @@ func main() {
 	dataDir := flag.String("data-dir", "data", "raft snapshot data directory")
 	peersFlag := flag.String("peers", "", "comma-separated id=raft_addr list for the full static cluster "+
 		"(same on every node), e.g. n1=127.0.0.1:7000,n2=127.0.0.1:7001,n3=127.0.0.1:7002 (required)")
+	brokerAddr := flag.String("broker-addr", "", "optional millrace-core address; topics committed to the cluster are created on it")
 	flag.Parse()
 
 	if *nodeID == "" || *peersFlag == "" {
@@ -38,6 +40,9 @@ func main() {
 	}
 
 	f := fsm.New(peerIDs)
+	if *brokerAddr != "" {
+		f.OnTopicCreated = broker.Mirror(*brokerAddr)
+	}
 
 	r, err := raftnode.Start(f, raftnode.Config{
 		NodeID:   *nodeID,
