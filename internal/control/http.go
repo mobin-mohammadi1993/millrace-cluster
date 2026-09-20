@@ -16,6 +16,8 @@ import (
 //	GET  /route?topic=T&partition=P  -> {"node_id": ..., "broker_addr": ..., "partitions": <count in T>}
 //	POST /topics {"name":..,"partitions":N} -> 201, or 409 {"error": ...}
 //	     (409 includes "not leader" -- POST to another node)
+//	GET  /groups?topic=T -> {"groups":[{"group","generation","members":[{"member","partitions"}]}]}
+//	     (groups with live members only; leader only, 409 otherwise)
 //	POST /groups/{join,heartbeat,leave} {"topic","group","member"} -> {"member","generation","partitions"}
 //	     (leader only, 409 otherwise; heartbeat of an unknown member is 404: re-join)
 func (s *Server) HTTPHandler() http.Handler {
@@ -61,6 +63,19 @@ func (s *Server) HTTPHandler() http.Handler {
 			return
 		}
 		writeJSON(w, http.StatusCreated, resp.Topic)
+	})
+
+	mux.HandleFunc("GET /groups", func(w http.ResponseWriter, r *http.Request) {
+		if s.Raft.State() != raft.Leader {
+			writeJSON(w, http.StatusConflict, map[string]string{"error": "not leader"})
+			return
+		}
+		t, ok := s.FSM.Topic(r.URL.Query().Get("topic"))
+		if !ok {
+			writeJSON(w, http.StatusNotFound, map[string]string{"error": "unknown topic"})
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"groups": s.Groups.Describe(t.Name, len(t.Partitions))})
 	})
 
 	// Consumer-group coordination (soft state on the leader; see package groups).

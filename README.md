@@ -63,7 +63,10 @@ reaching for "implement everything from scratch" as the portfolio flex.
   a generation; a member silent for `--group-session-timeout` (default 10s) is
   evicted. `join` returns `{member, generation, partitions}`; `heartbeat`
   returns the same (or 404 if the member is unknown: re-join). Leader only,
-  409 otherwise. `millrace-sdk`'s `GroupConsumer` drives it.
+  409 otherwise. `millrace-sdk`'s `GroupConsumer` drives it. `GET
+  /groups?topic=T` lists the topic's groups that have live members — each
+  group's generation and every member's partitions — which is what
+  `millrace-cli groups` and the dashboard's members table show.
 
 ## Honest limitations (current state)
 
@@ -157,8 +160,8 @@ rejects both a fetch and a produce for that partition ("not owned").
 
 `internal/groups/groups_test.go` unit-tests the coordinator on a fake clock:
 generation bumps, exact round-robin splits, eviction after the timeout,
-re-join under the old id, leave, group/topic isolation, and more members than
-partitions. The whole group flow is tested end to end from `millrace-sdk`
+re-join under the old id, leave, group/topic isolation, more members than
+partitions, and `Describe` (only groups with live members, sorted, one topic). The whole group flow is tested end to end from `millrace-sdk`
 (`test_consumer_group_splits_partitions_and_rebalances`) against three real
 cluster processes and three real brokers — see that README.
 

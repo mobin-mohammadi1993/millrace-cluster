@@ -70,6 +70,44 @@ func TestMembershipAssignmentAndEviction(t *testing.T) {
 	}
 }
 
+func TestDescribeListsLiveGroupsOfOneTopic(t *testing.T) {
+	c := New(10 * time.Second)
+	now := fakeClock(c)
+
+	if got := c.Describe("t", 3); len(got) != 0 {
+		t.Fatalf("nothing joined yet, got %+v", got)
+	}
+	c.Join("t", "workers", "bob", 3)
+	c.Join("t", "workers", "amy", 3)
+	c.Join("t", "audit", "solo", 3)
+	c.Join("other", "workers", "x", 3) // a different topic never shows up
+
+	want := []GroupInfo{
+		{"audit", 1, []MemberInfo{{"solo", []uint32{0, 1, 2}}}},
+		{"workers", 2, []MemberInfo{{"amy", []uint32{0, 2}}, {"bob", []uint32{1}}}},
+	}
+	if got := c.Describe("t", 3); !reflect.DeepEqual(got, want) {
+		t.Fatalf("got  %+v\nwant %+v", got, want)
+	}
+
+	// "audit" goes silent past the timeout and is evicted, so it drops out
+	// entirely; a group whose last member left does too.
+	*now = now.Add(6 * time.Second)
+	c.Heartbeat("t", "workers", "amy", 3)
+	c.Heartbeat("t", "workers", "bob", 3)
+	*now = now.Add(6 * time.Second)
+	c.Heartbeat("t", "workers", "amy", 3)
+	c.Heartbeat("t", "workers", "bob", 3)
+	c.Leave("other", "workers", "x")
+	got := c.Describe("t", 3)
+	if len(got) != 1 || got[0].Group != "workers" || len(got[0].Members) != 2 {
+		t.Fatalf("after eviction: %+v", got)
+	}
+	if got := c.Describe("other", 3); len(got) != 0 {
+		t.Fatalf("empty group should be omitted: %+v", got)
+	}
+}
+
 func TestMoreMembersThanPartitions(t *testing.T) {
 	c := New(time.Minute)
 	fakeClock(c)

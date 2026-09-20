@@ -14,6 +14,7 @@ import (
 	"errors"
 	"fmt"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 )
@@ -79,6 +80,43 @@ func assignment(g *group, member string, partitions int) []uint32 {
 		}
 	}
 	return mine
+}
+
+type MemberInfo struct {
+	Member     string   `json:"member"`
+	Partitions []uint32 `json:"partitions"`
+}
+
+type GroupInfo struct {
+	Group      string       `json:"group"`
+	Generation int          `json:"generation"`
+	Members    []MemberInfo `json:"members"`
+}
+
+// Describe lists the topic's groups that currently have live members (expired
+// ones are evicted first), sorted by group name, members sorted by id.
+func (c *Coordinator) Describe(topic string, partitions int) []GroupInfo {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	out := []GroupInfo{}
+	for key := range c.groups {
+		name, ok := strings.CutPrefix(key, topic+"\x00")
+		if !ok {
+			continue
+		}
+		g := c.group(topic, name)
+		if len(g.seen) == 0 {
+			continue
+		}
+		info := GroupInfo{Group: name, Generation: g.generation, Members: []MemberInfo{}}
+		for m := range g.seen {
+			info.Members = append(info.Members, MemberInfo{m, assignment(g, m, partitions)})
+		}
+		sort.Slice(info.Members, func(i, j int) bool { return info.Members[i].Member < info.Members[j].Member })
+		out = append(out, info)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Group < out[j].Group })
+	return out
 }
 
 // Join adds the member (an empty id gets a new one; an unknown id is accepted
