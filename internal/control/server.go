@@ -11,6 +11,7 @@ import (
 
 	pb "millrace-cluster/internal/controlpb"
 	"millrace-cluster/internal/fsm"
+	"millrace-cluster/internal/groups"
 )
 
 type Server struct {
@@ -20,6 +21,7 @@ type Server struct {
 	// Brokers maps node ID -> that node's millrace-core address (static,
 	// identical on every node), used to answer routing lookups.
 	Brokers map[string]string
+	Groups  *groups.Coordinator
 }
 
 func (s *Server) CreateTopic(ctx context.Context, req *pb.CreateTopicRequest) (*pb.CreateTopicResponse, error) {

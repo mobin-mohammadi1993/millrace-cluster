@@ -5,6 +5,8 @@ import (
 	"net/http"
 	"strconv"
 
+	"github.com/hashicorp/raft"
+
 	pb "millrace-cluster/internal/controlpb"
 )
 
@@ -14,6 +16,8 @@ import (
 //	GET  /route?topic=T&partition=P  -> {"node_id": ..., "broker_addr": ..., "partitions": <count in T>}
 //	POST /topics {"name":..,"partitions":N} -> 201, or 409 {"error": ...}
 //	     (409 includes "not leader" -- POST to another node)
+//	POST /groups/{join,heartbeat,leave} {"topic","group","member"} -> {"member","generation","partitions"}
+//	     (leader only, 409 otherwise; heartbeat of an unknown member is 404: re-join)
 func (s *Server) HTTPHandler() http.Handler {
 	mux := http.NewServeMux()
 
@@ -57,6 +61,45 @@ func (s *Server) HTTPHandler() http.Handler {
 			return
 		}
 		writeJSON(w, http.StatusCreated, resp.Topic)
+	})
+
+	// Consumer-group coordination (soft state on the leader; see package groups).
+	mux.HandleFunc("POST /groups/{op}", func(w http.ResponseWriter, r *http.Request) {
+		if s.Raft.State() != raft.Leader {
+			writeJSON(w, http.StatusConflict, map[string]string{"error": "not leader"})
+			return
+		}
+		var body struct {
+			Topic  string `json:"topic"`
+			Group  string `json:"group"`
+			Member string `json:"member"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil || body.Group == "" {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "need JSON {topic, group, member?}"})
+			return
+		}
+		t, ok := s.FSM.Topic(body.Topic)
+		if !ok {
+			writeJSON(w, http.StatusNotFound, map[string]string{"error": "unknown topic"})
+			return
+		}
+		n := len(t.Partitions)
+		switch r.PathValue("op") {
+		case "join":
+			writeJSON(w, http.StatusOK, s.Groups.Join(body.Topic, body.Group, body.Member, n))
+		case "heartbeat":
+			st, err := s.Groups.Heartbeat(body.Topic, body.Group, body.Member, n)
+			if err != nil { // unknown member: the caller should re-join
+				writeJSON(w, http.StatusNotFound, map[string]string{"error": err.Error()})
+				return
+			}
+			writeJSON(w, http.StatusOK, st)
+		case "leave":
+			s.Groups.Leave(body.Topic, body.Group, body.Member)
+			writeJSON(w, http.StatusOK, map[string]string{})
+		default:
+			writeJSON(w, http.StatusNotFound, map[string]string{"error": "unknown group operation"})
+		}
 	})
 
 	return mux

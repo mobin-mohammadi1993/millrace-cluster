@@ -49,15 +49,32 @@ reaching for "implement everything from scratch" as the portfolio flex.
   the node's local broker.
 - **`cmd/millrace-cluster`** — the node binary: `--node-id`, `--raft-addr`,
   `--grpc-addr`, `--data-dir`, `--peers`, plus optional `--brokers`
-  (`id=millrace-core_addr`, same on every node) and `--http-addr`.
+  (`id=millrace-core_addr`, same on every node), `--http-addr`, and
+  `--group-session-timeout`.
 - **`internal/control/http.go`** — a stdlib-only JSON API for clients that
   shouldn't need gRPC: `GET /route?topic=T&partition=P` →
   `{"node_id","broker_addr","partitions"}` (any node can answer; `partitions` is the topic's partition count), and `POST /topics`
   (leader only; a follower answers 409 "not leader", so try another node).
   `millrace-sdk`'s `RoutedClient` uses it to send each produce/fetch to the
   broker that owns the partition.
+- **`internal/groups`** + `POST /groups/{join,heartbeat,leave}` — the
+  consumer-group coordinator. Members of a `(topic, group)` are given
+  partitions round-robin over their sorted ids; every membership change bumps
+  a generation; a member silent for `--group-session-timeout` (default 10s) is
+  evicted. `join` returns `{member, generation, partitions}`; `heartbeat`
+  returns the same (or 404 if the member is unknown: re-join). Leader only,
+  409 otherwise. `millrace-sdk`'s `GroupConsumer` drives it.
 
 ## Honest limitations (current state)
+
+- **Group membership is soft state on the Raft leader.** Heartbeats are not
+  replicated (they'd swamp the log). After a leader change the new leader
+  knows no members, so each gets 404, re-joins under its old id and resumes
+  from its broker-side commits — a brief rebalance, no lost progress, but
+  possible re-delivery. There is no fencing by generation (an evicted member
+  that keeps running can still overwrite a commit), groups are never
+  garbage-collected, and assignment is plain round-robin (no stickiness, so a
+  membership change can move more partitions than necessary).
 
 - **Static membership.** The cluster's node set is fixed at bootstrap via
   `--peers`, identical on every node. There's no `Join`/`Leave` RPC and no
@@ -137,6 +154,13 @@ all three brokers. The HTTP routing API is tested end to end from
 real brokers, records produced through `RoutedClient`; then every broker is
 queried directly, asserting the owner has the record and every other broker
 rejects both a fetch and a produce for that partition ("not owned").
+
+`internal/groups/groups_test.go` unit-tests the coordinator on a fake clock:
+generation bumps, exact round-robin splits, eviction after the timeout,
+re-join under the old id, leave, group/topic isolation, and more members than
+partitions. The whole group flow is tested end to end from `millrace-sdk`
+(`test_consumer_group_splits_partitions_and_rebalances`) against three real
+cluster processes and three real brokers — see that README.
 
 ## Wire/API formats
 

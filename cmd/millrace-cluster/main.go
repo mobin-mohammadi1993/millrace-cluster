@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/hashicorp/raft"
 	"google.golang.org/grpc"
@@ -18,6 +19,7 @@ import (
 	"millrace-cluster/internal/control"
 	pb "millrace-cluster/internal/controlpb"
 	"millrace-cluster/internal/fsm"
+	"millrace-cluster/internal/groups"
 	"millrace-cluster/internal/raftnode"
 )
 
@@ -31,6 +33,7 @@ func main() {
 	brokersFlag := flag.String("brokers", "", "optional id=millrace-core_addr list, same on every node: "+
 		"committed topics are created on this node's own broker, and /route answers with these addresses")
 	httpAddr := flag.String("http-addr", "", "optional listen address for the JSON routing/topics API")
+	groupTimeout := flag.Duration("group-session-timeout", 10*time.Second, "a consumer-group member that hasn't heartbeated for this long is evicted")
 	flag.Parse()
 
 	if *nodeID == "" || *peersFlag == "" {
@@ -73,7 +76,7 @@ func main() {
 		log.Fatalf("listening on %s: %v", *grpcAddr, err)
 	}
 	grpcServer := grpc.NewServer()
-	srv := &control.Server{Raft: r, FSM: f, Brokers: brokers}
+	srv := &control.Server{Raft: r, FSM: f, Brokers: brokers, Groups: groups.New(*groupTimeout)}
 	pb.RegisterControlServer(grpcServer, srv)
 	if *httpAddr != "" {
 		go func() { log.Fatalf("http serve: %v", http.ListenAndServe(*httpAddr, srv.HTTPHandler())) }()
