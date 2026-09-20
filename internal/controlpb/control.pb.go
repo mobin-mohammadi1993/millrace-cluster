@@ -136,9 +136,12 @@ func (x *CreateTopicResponse) GetTopic() *TopicInfo {
 }
 
 type PartitionAssignment struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Partition     uint32                 `protobuf:"varint,1,opt,name=partition,proto3" json:"partition,omitempty"`
-	NodeId        string                 `protobuf:"bytes,2,opt,name=node_id,json=nodeId,proto3" json:"node_id,omitempty"`
+	state     protoimpl.MessageState `protogen:"open.v1"`
+	Partition uint32                 `protobuf:"varint,1,opt,name=partition,proto3" json:"partition,omitempty"`
+	NodeId    string                 `protobuf:"bytes,2,opt,name=node_id,json=nodeId,proto3" json:"node_id,omitempty"`
+	// The owning node's millrace-core address; empty if that node has no
+	// --brokers entry.
+	BrokerAddr    string `protobuf:"bytes,3,opt,name=broker_addr,json=brokerAddr,proto3" json:"broker_addr,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -183,6 +186,13 @@ func (x *PartitionAssignment) GetPartition() uint32 {
 func (x *PartitionAssignment) GetNodeId() string {
 	if x != nil {
 		return x.NodeId
+	}
+	return ""
+}
+
+func (x *PartitionAssignment) GetBrokerAddr() string {
+	if x != nil {
+		return x.BrokerAddr
 	}
 	return ""
 }
@@ -340,10 +350,12 @@ const file_control_proto_rawDesc = "" +
 	"\x13CreateTopicResponse\x12\x0e\n" +
 	"\x02ok\x18\x01 \x01(\bR\x02ok\x12\x14\n" +
 	"\x05error\x18\x02 \x01(\tR\x05error\x12(\n" +
-	"\x05topic\x18\x03 \x01(\v2\x12.control.TopicInfoR\x05topic\"L\n" +
+	"\x05topic\x18\x03 \x01(\v2\x12.control.TopicInfoR\x05topic\"m\n" +
 	"\x13PartitionAssignment\x12\x1c\n" +
 	"\tpartition\x18\x01 \x01(\rR\tpartition\x12\x17\n" +
-	"\anode_id\x18\x02 \x01(\tR\x06nodeId\"]\n" +
+	"\anode_id\x18\x02 \x01(\tR\x06nodeId\x12\x1f\n" +
+	"\vbroker_addr\x18\x03 \x01(\tR\n" +
+	"brokerAddr\"]\n" +
 	"\tTopicInfo\x12\x12\n" +
 	"\x04name\x18\x01 \x01(\tR\x04name\x12<\n" +
 	"\n" +

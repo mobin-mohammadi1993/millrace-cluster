@@ -42,7 +42,8 @@ reaching for "implement everything from scratch" as the portfolio flex.
 - **`internal/control`** + **`proto/control.proto`** — the gRPC `Control`
   service: `CreateTopic` (routes through `raft.Apply`, rejecting with a
   "not leader" error plus the current leader's raft address if called on a
-  follower) and `ClusterState` (a direct FSM read).
+  follower) and `ClusterState` (a direct FSM read; each `PartitionAssignment`
+  carries the owning node's `broker_addr` from `--brokers`).
 - **`internal/broker`** — a minimal `millrace-core` client (`CreateTopic`,
   `DescribeTopic`) and `Mirror`, the FSM hook that creates committed topics on
   the node's local broker.

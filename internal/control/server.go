@@ -48,7 +48,7 @@ func (s *Server) CreateTopic(ctx context.Context, req *pb.CreateTopicRequest) (*
 	case error:
 		return &pb.CreateTopicResponse{Ok: false, Error: v.Error()}, nil
 	case fsm.TopicInfo:
-		return &pb.CreateTopicResponse{Ok: true, Topic: toProtoTopic(v)}, nil
+		return &pb.CreateTopicResponse{Ok: true, Topic: toProtoTopic(v, s.Brokers)}, nil
 	default:
 		return nil, fmt.Errorf("unexpected FSM response type %T", v)
 	}
@@ -58,17 +58,18 @@ func (s *Server) ClusterState(ctx context.Context, req *pb.ClusterStateRequest) 
 	_, leaderID := s.Raft.LeaderWithID()
 	resp := &pb.ClusterStateResponse{LeaderId: string(leaderID)}
 	for _, t := range s.FSM.ListTopics() {
-		resp.Topics = append(resp.Topics, toProtoTopic(t))
+		resp.Topics = append(resp.Topics, toProtoTopic(t, s.Brokers))
 	}
 	return resp, nil
 }
 
-func toProtoTopic(t fsm.TopicInfo) *pb.TopicInfo {
+func toProtoTopic(t fsm.TopicInfo, brokers map[string]string) *pb.TopicInfo {
 	pt := &pb.TopicInfo{Name: t.Name}
 	for _, p := range t.Partitions {
 		pt.Partitions = append(pt.Partitions, &pb.PartitionAssignment{
-			Partition: p.Partition,
-			NodeId:    p.NodeID,
+			Partition:  p.Partition,
+			NodeId:     p.NodeID,
+			BrokerAddr: brokers[p.NodeID],
 		})
 	}
 	return pt

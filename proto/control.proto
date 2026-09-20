@@ -29,6 +29,9 @@ message CreateTopicResponse {
 message PartitionAssignment {
   uint32 partition = 1;
   string node_id = 2;
+  // The owning node's millrace-core address; empty if that node has no
+  // --brokers entry.
+  string broker_addr = 3;
 }
 
 message TopicInfo {
