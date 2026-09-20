@@ -76,6 +76,10 @@ Brings up `n1`, `n2`, `n3` on a compose network, each bootstrapped with
 the same static 3-node configuration. gRPC control planes are published on
 `localhost:8001`, `8002`, `8003`.
 
+**Not yet verified end to end:** the image builds, but Docker Desktop's engine
+would not start in the environment this was developed in, so `up` has never
+been run. The Raft behaviour it would demo is what the `go test` below proves.
+
 ### Locally (three processes, one machine)
 
 ```bash
