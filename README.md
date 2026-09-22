@@ -40,10 +40,11 @@ reaching for "implement everything from scratch" as the portfolio flex.
   "honest limitations"). `CreateTopic` takes a `replication_factor`: `0`/`1`
   keeps the old single-owner behavior, and `N` picks a leader plus `N-1`
   followers per partition (round-robin, distinct nodes since `N` can't
-  exceed the live node count). `PromotePartition` is the manual-failover
-  command: it swaps a partition's leader for a current replica and drops the
-  old leader from the replica set (it does not contact or demote that old
-  leader -- see "honest limitations").
+  exceed the live node count). Every `PartitionAssignment` also carries a
+  `Generation` (starts at 1, +1 on every promote) -- the fencing epoch handed
+  to `millrace-core`'s `PromoteToLeader`/`DemoteToFollower`; `PromotePartition`
+  rejects a command that doesn't name exactly `Generation+1`, so a stale or
+  duplicate promote can't apply out of order.
 - **`internal/raftnode`** — wires up one `hashicorp/raft` node: real TCP
   transport, file-backed snapshot store, and either a one-time
   `BootstrapCluster` (static `--peers`, a new cluster) or, if `Peers` is left
@@ -55,15 +56,37 @@ reaching for "implement everything from scratch" as the portfolio flex.
   follower) and `ClusterState` (a direct FSM read; each `PartitionAssignment`
   carries the owning node's `broker_addr` from `--brokers`).
 - **`internal/broker`** — a minimal `millrace-core` client (`CreateTopic`,
-  `CreateTopicReplica`, `PromoteToLeader`, `DescribeTopic`) and `Mirror`, the
-  FSM hook that creates each committed topic on the node's local broker: as
-  Leader for partitions it leads, as Follower (replicating from the leader's
-  own broker address, resolved via the FSM's node map) for partitions where
-  it's a replica.
+  `CreateTopicReplica`, `PromoteToLeader`, `DemoteToFollower`, `DescribeTopic`)
+  and `Mirror`, the FSM hook that creates each committed topic on the node's
+  local broker: as Leader (with its epoch and total replica count) for
+  partitions it leads, as Follower (replicating from the leader's own broker
+  address, resolved via the FSM's node map) for partitions where it's a
+  replica.
+- **`internal/control.Server.PromotePartition`** — the shared failover
+  primitive both the manual HTTP endpoint and the automatic detector below
+  call: promotes the target's real broker (`PromoteToLeader`), applies the
+  FSM's `PromotePartition` metadata update, then best-effort fences the old
+  leader *and* re-points every other surviving replica at the new leader
+  (both via `DemoteToFollower`) -- the second part matters as much as the
+  first: without it, a `replication_factor >= 3` partition's other followers
+  would keep replicating from the dead old leader forever, and the new
+  leader's own ack-quorum could never be satisfied.
+- **`internal/control/failover.go`** — `Server.RunFailureDetector` is
+  automatic failover: it health-checks (`DescribeTopic`) every partition's
+  current leader broker on an interval, and after `FailureThreshold`
+  consecutive failures, promotes the first replica whose own broker is
+  healthy, via the same `PromotePartition` the manual endpoint uses. Only
+  acts while this node is the Raft leader; failure counts are soft,
+  in-memory state on whichever node that currently is -- the same
+  "soft state on the Raft leader" trade-off this project already makes for
+  consumer-group membership (below): a Raft leadership change resets
+  detection to zero. Wired up by default in `cmd/millrace-cluster`
+  (`--auto-failover=false` to disable).
 - **`cmd/millrace-cluster`** — the node binary. Bootstrap a new cluster with
   `--node-id`, `--raft-addr`, `--grpc-addr`, `--data-dir`, `--peers`, plus
   optional `--brokers` (`id=millrace-core_addr`, same on every node),
-  `--http-addr`, and `--group-session-timeout`. **Or** join an already-running
+  `--http-addr`, `--group-session-timeout`, and `--auto-failover` (default
+  `true`). **Or** join an already-running
   one with `--join` (comma-separated `--http-addr`s of existing members)
   instead of `--peers`/`--brokers`, plus `--broker-addr` for this node's own
   broker. A joining node's first move is `GET /cluster/nodes` against
@@ -77,13 +100,12 @@ reaching for "implement everything from scratch" as the portfolio flex.
   are the partition's current *leader*; `partitions` is the topic's partition
   count), `POST /topics` (leader only; a follower answers 409 "not leader",
   so try another node), and `POST /partitions/promote
-  {"topic","partition","node_id"}` (leader only) -- the manual failover
-  primitive: promotes `node_id`'s real broker first (`broker.PromoteToLeader`,
-  safe to retry -- it's a no-op if already leader), then applies
-  `PromotePartition` to update the cluster's metadata to match.
-  `millrace-sdk`'s `RoutedClient` uses `/route` to send each produce/fetch to
-  the broker that owns the partition; `millrace-cli cluster-promote` wraps
-  `/partitions/promote`.
+  {"topic","partition","node_id"}` → `{"fenced": bool}` (leader only) -- the
+  *manual* half of failover, a thin wrapper around
+  `Server.PromotePartition` (see above); `"fenced"` reports whether the old
+  leader was actually reachable and demoted. `millrace-sdk`'s `RoutedClient`
+  uses `/route` to send each produce/fetch to the broker that owns the
+  partition; `millrace-cli cluster-promote` wraps `/partitions/promote`.
 - **`internal/groups`** + `POST /groups/{join,heartbeat,leave}` — the
   consumer-group coordinator. A `(topic, group)`'s partitions are shared
   fairly (within one of each other) across its live members, **sticky**: a
@@ -175,21 +197,32 @@ reaching for "implement everything from scratch" as the portfolio flex.
   retried if a broker is down, so a produce right after `POST /topics` can
   briefly fail with "unknown topic"; topics restored from a Raft snapshot are
   not re-mirrored; the Compose file doesn't run brokers yet.
-- **Replication is real but async, and failover is manual only.** A
-  Follower's broker pulls from its Leader's broker over the existing `Fetch`
-  wire op (see `millrace-core/src/replicator.rs`) -- genuine cross-broker
-  data replication, not just metadata -- but there's no ack-quorum: a
-  `Produce` succeeds as soon as the leader durably appends it, before any
-  follower has replicated it, so a leader that dies an instant after
-  acknowledging a write can lose that write even after a promote. Nothing
-  detects a dead leader or triggers a promote automatically; an operator (or
-  a future health-checker, not built here) decides when to call
-  `/partitions/promote`, and that call does **not** fence or contact the old
-  leader -- if it's actually still alive and reachable, both it and the
-  newly-promoted node will accept writes independently (split brain) until
-  someone stops the old one. This is the same trade-off `millrace-core`'s own
-  README names for the broker-level mechanism; this layer just wires it into
-  cluster placement and adds the one-command manual promote.
+- **Replication is real, fenced, quorum-acked, and failover can now be
+  automatic -- with real remaining limits.** A Follower's broker pulls from
+  its Leader's broker over the existing `Fetch` wire op (see
+  `millrace-core/src/replicator.rs`) -- genuine cross-broker data
+  replication, not just metadata. `Produce` on a replicated partition waits
+  for a majority of replicas to ack before returning (5s timeout; the write
+  stays durable on the leader either way -- see `millrace-core`'s README).
+  Both `/partitions/promote` and `Server.RunFailureDetector`'s automatic
+  path go through the same `Server.PromotePartition`: it epoch-fences the
+  promote/demote (a stale one is rejected, matching `millrace-core`'s own
+  guard), and best-effort demotes both the old leader *and* every other
+  surviving replica to follow the new one. What's still real but limited:
+  the demote is best-effort over the network -- if the old leader is
+  unreachable from the cluster's control plane (the common case: it's
+  usually down) there's nothing more to fence, and no real split-brain risk
+  either, since a dead broker accepts no writes from anyone; but an old
+  leader that's alive and reachable by *clients* while merely unreachable
+  from this cluster's own health checks (a genuine network partition, not a
+  crash) is a case nothing here detects or fences -- that needs a per-write
+  lease/quorum check this pass doesn't build. `RunFailureDetector`'s failure
+  counts are soft, in-memory, per-Raft-leader state (reset on a Raft
+  leadership change, the same trade-off this project already makes for
+  consumer-group membership); detection latency is
+  `FailureThreshold * CheckInterval` (defaults: 3 x 2s = up to ~6s), and it
+  only promotes to a replica whose own broker currently answers a health
+  check -- if none do, it retries next tick rather than guessing.
 
 ## Running a 3-node cluster
 
@@ -280,10 +313,34 @@ Follower on the other) via real `CreateTopicReplica` calls, produces
 directly to the leader's broker over raw TCP, and polls the follower's
 broker until its own end-offset independently reaches the same count —
 proof the data crossed the wire, not just the metadata. It also asserts the
-FSM rejects `PromotePartition` for a node that isn't actually a replica,
-then does a real manual promote (`broker.PromoteToLeader` + FSM
-`PromotePartition`) and checks the promoted node accepts a new write
-directly and the FSM has dropped the old leader from the replica set.
+FSM rejects `PromotePartition` for a stale generation, then does a real
+manual promote (`broker.PromoteToLeader` + FSM `PromotePartition`) and
+checks the promoted node accepts a new write directly and the FSM has
+dropped the old leader from the replica set.
+
+`TestPromoteHTTPEndpointFencesOldLeader` (same file) drives the *actual*
+`POST /partitions/promote` HTTP handler (not the raw FSM/broker calls) end
+to end: two real Raft nodes + two real brokers behind real `httptest`
+servers, a `replication_factor=2` topic, then a promote call that must
+report `"fenced": true` and leave the old leader genuinely demoted -- proven
+by producing to the new leader and watching the old one (now a real
+Follower) replicate it, not just by checking it rejects writes.
+
+`TestAutomaticFailoverPromotesReplicaWhenLeaderProcessDies` is the
+automatic-failover proof: three real Raft nodes + three real
+`millrace-core.exe` **processes** (not in-process listeners), a
+`replication_factor=3` topic, `Server.RunFailureDetector` running with a
+200ms check interval. The original leader's real OS process is killed
+(`cmd.Process.Kill()`) with **no manual promote call anywhere in the
+test** -- the assertion just polls the FSM until some other node becomes
+leader, then confirms that node is a real, independent, working leader
+(produces and reads back a new record). Building this test caught a real
+bug: the first version only fenced the *old* leader and left the *other*
+surviving replica still replicating from the dead node, so the newly
+promoted leader's own ack-quorum could never be satisfied and every
+`Produce` to it timed out -- found by the test actually failing, not by
+inspection, and fixed by having `PromotePartition` re-point every other
+replica at the new leader too (see `internal/control/server.go`).
 
 `internal/groups/groups_test.go` unit-tests the coordinator on a fake clock:
 generation bumps, exact fair-share splits, eviction after the timeout,
