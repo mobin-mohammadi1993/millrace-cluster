@@ -44,6 +44,9 @@ func main() {
 	httpAddr := flag.String("http-addr", "", "optional listen address for the JSON routing/topics/cluster API "+
 		"(required to use --join, since joining and leaving both go through it)")
 	groupTimeout := flag.Duration("group-session-timeout", 10*time.Second, "a consumer-group member that hasn't heartbeated for this long is evicted")
+	autoFailover := flag.Bool("auto-failover", true, "automatically promote a healthy replica when a partition's "+
+		"leader broker fails health checks (see control.FailoverConfig); reuses the same fenced promote as "+
+		"POST /partitions/promote, just triggered by this node's own health checks instead of an operator")
 	flag.Parse()
 
 	if *nodeID == "" {
@@ -111,6 +114,9 @@ func main() {
 	pb.RegisterControlServer(grpcServer, srv)
 	if *httpAddr != "" {
 		go func() { log.Fatalf("http serve: %v", http.ListenAndServe(*httpAddr, srv.HTTPHandler())) }()
+	}
+	if *autoFailover {
+		go srv.RunFailureDetector(nil, control.DefaultFailoverConfig())
 	}
 
 	if *joinFlag != "" {

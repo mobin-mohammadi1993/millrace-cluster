@@ -4,13 +4,16 @@ import (
 	"encoding/binary"
 	"io"
 	"net"
+	"net/http/httptest"
 	"testing"
 	"time"
 
 	"github.com/hashicorp/raft"
 
 	"millrace-cluster/internal/broker"
+	"millrace-cluster/internal/control"
 	"millrace-cluster/internal/fsm"
+	"millrace-cluster/internal/groups"
 	"millrace-cluster/internal/raftnode"
 )
 
@@ -56,6 +59,21 @@ func rawProduce(t *testing.T, addr, topic string, partition uint32, payload []by
 		n := binary.LittleEndian.Uint16(resp[1:3])
 		t.Fatalf("produce to %s: %s", addr, resp[3:3+n])
 	}
+}
+
+// rawProduceExpectingRejection is rawProduce's inverse: true if the broker
+// answered with an Error (the expected outcome for a demoted/non-leader
+// partition), false if it accepted the write.
+func rawProduceExpectingRejection(t *testing.T, addr, topic string, partition uint32) bool {
+	t.Helper()
+	body := []byte{2, 0, 0} // op 2 = Produce
+	binary.LittleEndian.PutUint16(body[1:], uint16(len(topic)))
+	body = append(body, topic...)
+	body = binary.LittleEndian.AppendUint32(body, partition)
+	body = binary.LittleEndian.AppendUint32(body, 4)
+	body = append(body, []byte("nope")...)
+	resp := rawRoundTrip(t, addr, body)
+	return resp[0] == 1
 }
 
 // rawEndOffset returns partition 0's end offset via DescribeTopic (op 4);
@@ -193,7 +211,7 @@ func TestReplicatedTopicMirrorsRealDataAndSupportsManualPromote(t *testing.T) {
 	// the partition -- the guard that stops an operator (or a bug in the
 	// HTTP handler) from fabricating a bogus leader.
 	badCmd := fsm.Command{Type: fsm.CommandPromotePartition, PromotePartition: &fsm.PromotePartitionCommand{
-		Topic: "orders", Partition: 0, NodeID: "not-a-replica",
+		Topic: "orders", Partition: 0, NodeID: "not-a-replica", Generation: 2,
 	}}
 	badData, err := badCmd.Encode()
 	if err != nil {
@@ -210,11 +228,16 @@ func TestReplicatedTopicMirrorsRealDataAndSupportsManualPromote(t *testing.T) {
 	// Manual promote: the cluster's HTTP handler does this in two steps
 	// (real broker RPC, then FSM metadata) -- exercised directly here since
 	// this test doesn't otherwise need an HTTP server.
-	if err := broker.PromoteToLeader(followerAddr, "orders", 0); err != nil {
+	// replicas: 1 -- this test is about mirroring/failover wiring, not
+	// ack-quorum (see millrace-core's own replication_test.rs for that); the
+	// old leader isn't demoted to a real follower here, so claiming
+	// replicas > 1 would make every produce below block for a quorum ack
+	// that can never arrive.
+	if err := broker.PromoteToLeader(followerAddr, "orders", 0, 2, 1); err != nil {
 		t.Fatalf("promoting follower's broker: %v", err)
 	}
 	promoteCmd := fsm.Command{Type: fsm.CommandPromotePartition, PromotePartition: &fsm.PromotePartitionCommand{
-		Topic: "orders", Partition: 0, NodeID: followerID,
+		Topic: "orders", Partition: 0, NodeID: followerID, Generation: 2,
 	}}
 	data, err := promoteCmd.Encode()
 	if err != nil {
@@ -247,11 +270,235 @@ func TestReplicatedTopicMirrorsRealDataAndSupportsManualPromote(t *testing.T) {
 	}
 
 	// The FSM must have dropped the old leader from the replica set (this
-	// checks the FSM's bookkeeping; it doesn't fence the old leader's
-	// broker live, since automatic failover/fencing is out of scope -- see
-	// README).
+	// test exercises the raw FSM/broker calls directly, not the HTTP
+	// handler, so the old leader's broker itself isn't demoted here -- see
+	// TestPromoteHTTPEndpointFencesOldLeader for that, and the old leader
+	// is deliberately left alive-but-stale below to prove the FSM's
+	// bookkeeping alone, independent of whether fencing ran).
 	top, _ := fsms[leaderID].Topic("orders")
 	if containsID(top.Partitions[0].Replicas, leaderID) {
 		t.Fatalf("old leader %s should have been dropped from the replica set, got %v", leaderID, top.Partitions[0].Replicas)
+	}
+}
+
+// The real, operator-facing path: POST /partitions/promote through the
+// actual HTTP handler (not the raw FSM/broker calls above). Proves the old
+// leader is really fenced -- its broker gets demoted to a live Follower of
+// the new leader, not just dropped from metadata -- and that the endpoint
+// reports "fenced": true when that succeeds.
+func TestPromoteHTTPEndpointFencesOldLeader(t *testing.T) {
+	ids := []string{"n1", "n2"}
+	raftAddrs := map[string]string{"n1": "127.0.0.1:19311", "n2": "127.0.0.1:19312"}
+	var servers []raft.Server
+	for _, id := range ids {
+		servers = append(servers, raft.Server{ID: raft.ServerID(id), Address: raft.ServerAddress(raftAddrs[id])})
+	}
+
+	brokers := map[string]string{}
+	for _, id := range ids {
+		brokers[id] = startBroker(t)
+	}
+
+	var httpAddrs []string
+	var fsms []*fsm.FSM
+	for _, id := range ids {
+		f := fsm.New(brokers)
+		f.OnTopicCreated = broker.Mirror(brokers[id], id, f)
+		fsms = append(fsms, f)
+		r, err := raftnode.Start(f, raftnode.Config{
+			NodeID: id, BindAddr: raftAddrs[id], DataDir: t.TempDir(), Peers: servers,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = r.Shutdown().Error() })
+		srv := &control.Server{Raft: r, FSM: f, Groups: groups.New(time.Minute)}
+		ts := httptest.NewServer(srv.HTTPHandler())
+		t.Cleanup(ts.Close)
+		httpAddrs = append(httpAddrs, ts.URL)
+	}
+
+	retryPost(t, httpAddrs, "/topics", map[string]any{"name": "events", "partitions": 1, "replication_factor": 2})
+
+	for id, addr := range brokers {
+		deadline := time.Now().Add(5 * time.Second)
+		for {
+			if n, err := broker.DescribeTopic(addr, "events"); err == nil && n == 1 {
+				break
+			}
+			if time.Now().After(deadline) {
+				t.Fatalf("topic never mirrored onto %s's broker", id)
+			}
+			time.Sleep(50 * time.Millisecond)
+		}
+	}
+
+	var topic fsm.TopicInfo
+	for _, f := range fsms {
+		if top, ok := f.Topic("events"); ok {
+			topic = top
+			break
+		}
+	}
+	if len(topic.Partitions) != 1 || len(topic.Partitions[0].Replicas) != 1 {
+		t.Fatalf("unexpected topic shape: %+v", topic)
+	}
+	leaderID, followerID := topic.Partitions[0].NodeID, topic.Partitions[0].Replicas[0]
+	leaderAddr, followerAddr := brokers[leaderID], brokers[followerID]
+
+	resp := retryPost(t, httpAddrs, "/partitions/promote", map[string]any{
+		"topic": "events", "partition": 0, "node_id": followerID,
+	})
+	if fenced, _ := resp["fenced"].(bool); !fenced {
+		t.Fatalf(`expected "fenced": true (the old leader's broker is reachable), got %v`, resp)
+	}
+
+	// The old leader must now refuse direct writes -- it's really been
+	// demoted, not just dropped from the FSM's bookkeeping. DemoteToFollower
+	// is applied synchronously by the handler above, so this should already
+	// hold; poll briefly anyway to absorb any last scheduling delay.
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		if rawProduceExpectingRejection(t, leaderAddr, "events", 0) {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("old (demoted) leader still accepted a direct write")
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+
+	// Produce to the new leader and confirm the demoted old leader actually
+	// replicates it -- the behavioral proof of fencing, not just a rejected
+	// write.
+	rawProduce(t, followerAddr, "events", 0, []byte("post-fence"))
+	deadline = time.Now().Add(5 * time.Second)
+	for {
+		if rawEndOffset(t, leaderAddr, "events") == 1 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("fenced old leader never replicated from the new leader")
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+}
+
+// The automatic failover proof: with no operator, no manual promote call,
+// and no HTTP request naming a replacement, a real leader *process* is
+// killed and the cluster's own health-checker (control.Server.RunFailureDetector)
+// notices and promotes a healthy replica on its own -- reusing the exact
+// same fenced PromotePartition path the manual endpoint uses.
+func TestAutomaticFailoverPromotesReplicaWhenLeaderProcessDies(t *testing.T) {
+	ids := []string{"n1", "n2", "n3"}
+	raftAddrs := map[string]string{"n1": "127.0.0.1:19321", "n2": "127.0.0.1:19322", "n3": "127.0.0.1:19323"}
+	var servers []raft.Server
+	for _, id := range ids {
+		servers = append(servers, raft.Server{ID: raft.ServerID(id), Address: raft.ServerAddress(raftAddrs[id])})
+	}
+
+	brokers := map[string]string{}
+	kills := map[string]func(){}
+	for _, id := range ids {
+		addr, kill := startKillableBroker(t)
+		brokers[id] = addr
+		kills[id] = kill
+	}
+
+	var httpAddrs []string
+	var fsms []*fsm.FSM
+	for _, id := range ids {
+		f := fsm.New(brokers)
+		f.OnTopicCreated = broker.Mirror(brokers[id], id, f)
+		fsms = append(fsms, f)
+		r, err := raftnode.Start(f, raftnode.Config{
+			NodeID: id, BindAddr: raftAddrs[id], DataDir: t.TempDir(), Peers: servers,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = r.Shutdown().Error() })
+		srv := &control.Server{Raft: r, FSM: f, Groups: groups.New(time.Minute)}
+		ts := httptest.NewServer(srv.HTTPHandler())
+		t.Cleanup(ts.Close)
+		httpAddrs = append(httpAddrs, ts.URL)
+
+		stop := make(chan struct{})
+		t.Cleanup(func() { close(stop) })
+		// Fast detection window for a test that shouldn't take forever:
+		// 2 checks x 200ms = well under a second once the leader is dead.
+		go srv.RunFailureDetector(stop, control.FailoverConfig{CheckInterval: 200 * time.Millisecond, FailureThreshold: 2})
+	}
+
+	retryPost(t, httpAddrs, "/topics", map[string]any{"name": "critical", "partitions": 1, "replication_factor": 3})
+
+	for id, addr := range brokers {
+		deadline := time.Now().Add(5 * time.Second)
+		for {
+			if n, err := broker.DescribeTopic(addr, "critical"); err == nil && n == 1 {
+				break
+			}
+			if time.Now().After(deadline) {
+				t.Fatalf("topic never mirrored onto %s's broker", id)
+			}
+			time.Sleep(50 * time.Millisecond)
+		}
+	}
+
+	var topic fsm.TopicInfo
+	for _, f := range fsms {
+		if top, ok := f.Topic("critical"); ok {
+			topic = top
+			break
+		}
+	}
+	origLeaderID := topic.Partitions[0].NodeID
+	if len(topic.Partitions[0].Replicas) != 2 {
+		t.Fatalf("expected 2 replicas, got %v", topic.Partitions[0].Replicas)
+	}
+
+	rawProduce(t, brokers[origLeaderID], "critical", 0, []byte("before-death"))
+	for _, replicaID := range topic.Partitions[0].Replicas {
+		deadline := time.Now().Add(5 * time.Second)
+		for rawEndOffset(t, brokers[replicaID], "critical") != 1 {
+			if time.Now().After(deadline) {
+				t.Fatalf("replica %s never caught up before the kill", replicaID)
+			}
+			time.Sleep(20 * time.Millisecond)
+		}
+	}
+
+	t.Logf("killing original leader %s (%s)", origLeaderID, brokers[origLeaderID])
+	kills[origLeaderID]()
+
+	// No manual call anywhere below -- just wait for the cluster's own
+	// health-checker to notice and act.
+	var newLeaderID string
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		for _, f := range fsms {
+			if top, ok := f.Topic("critical"); ok && top.Partitions[0].NodeID != origLeaderID {
+				newLeaderID = top.Partitions[0].NodeID
+				break
+			}
+		}
+		if newLeaderID != "" {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("no automatic failover happened within 10s of the leader dying")
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	if newLeaderID == origLeaderID {
+		t.Fatalf("failover picked the dead node again: %s", newLeaderID)
+	}
+	t.Logf("auto-failover promoted %s", newLeaderID)
+
+	// The auto-promoted leader must be a genuinely independent, working
+	// leader -- not just a metadata label.
+	rawProduce(t, brokers[newLeaderID], "critical", 0, []byte("after-failover"))
+	if got := rawEndOffset(t, brokers[newLeaderID], "critical"); got != 2 {
+		t.Fatalf("auto-promoted leader end offset = %d, want 2", got)
 	}
 }

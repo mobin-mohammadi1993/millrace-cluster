@@ -22,6 +22,16 @@ var boundAddr = regexp.MustCompile(`listening on (127\.0\.0\.1:\d+)`)
 // port and returns its address.
 func startBroker(t *testing.T) string {
 	t.Helper()
+	addr, _ := startKillableBroker(t)
+	return addr
+}
+
+// startKillableBroker is startBroker plus a kill func the test can call
+// deliberately (not just at cleanup) -- e.g. to simulate a leader broker
+// actually dying for a real auto-failover test. Calling kill twice, or
+// after the test's own cleanup already ran, is harmless.
+func startKillableBroker(t *testing.T) (addr string, kill func()) {
+	t.Helper()
 	bin, _ := filepath.Abs(filepath.Join("..", "..", "..", "millrace-core", "target", "release", "millrace-core.exe"))
 	if _, err := os.Stat(bin); err != nil {
 		t.Skipf("millrace-core not built (%s): run `cargo build --release` there", bin)
@@ -36,16 +46,17 @@ func startBroker(t *testing.T) string {
 	if err := cmd.Start(); err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _ = cmd.Process.Kill(); _ = cmd.Wait() })
+	kill = func() { _ = cmd.Process.Kill(); _ = cmd.Wait() }
+	t.Cleanup(kill)
 
 	sc := bufio.NewScanner(out)
 	for sc.Scan() {
 		if m := boundAddr.FindStringSubmatch(sc.Text()); m != nil {
-			return m[1]
+			return m[1], kill
 		}
 	}
 	t.Fatal("broker never reported its address")
-	return ""
+	return "", kill
 }
 
 // The cluster <-> core wiring: a CreateTopic committed through Raft must show

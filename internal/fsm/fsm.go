@@ -20,6 +20,12 @@ type PartitionAssignment struct {
 	// Follower node ids replicating from the leader; empty unless the topic
 	// was created with a replication_factor > 1.
 	Replicas []string `json:"replicas,omitempty"`
+	// Starts at 1 and increases by exactly 1 on every PromotePartition --
+	// the source of truth for millrace-core's per-partition fencing epoch
+	// (see broker.PromoteToLeader/DemoteToFollower). A promote is rejected
+	// unless it names Generation+1, so a stale or duplicate promote command
+	// can't silently apply out of order.
+	Generation uint64 `json:"generation"`
 }
 
 type TopicInfo struct {
@@ -119,7 +125,7 @@ func (f *FSM) applyCreateTopic(c *CreateTopicCommand) interface{} {
 		for r := uint32(1); r < rf; r++ {
 			replicas = append(replicas, nodeIDs[(int(i)+int(r))%n])
 		}
-		partitions[i] = PartitionAssignment{Partition: i, NodeID: leader, Replicas: replicas}
+		partitions[i] = PartitionAssignment{Partition: i, NodeID: leader, Replicas: replicas, Generation: 1}
 	}
 	topic := TopicInfo{Name: c.Name, Partitions: partitions}
 	f.topics[c.Name] = topic
@@ -132,10 +138,12 @@ func (f *FSM) applyCreateTopic(c *CreateTopicCommand) interface{} {
 // applyPromotePartition records that c.NodeID is now the partition's leader,
 // after the caller has already promoted it on the real broker (see
 // broker.PromoteToLeader) -- this only updates the cluster's metadata to
-// match. The old leader is dropped from the replica set rather than kept as
-// a (possibly false) follower entry: this command doesn't contact or demote
-// it, so the caller is responsible for making sure it's actually down or
-// otherwise no longer serving writes (manual failover, not automatic).
+// match. Rejected unless c.Generation is exactly the partition's current
+// Generation+1 (a stale or duplicate promote can't silently apply out of
+// order -- the same fencing guard millrace-core's Topic::promote enforces on
+// the broker side). The old leader is dropped from the replica set; this
+// command doesn't itself contact or demote it -- the HTTP handler does that
+// best-effort right after (see http.go), which is what actually fences it.
 func (f *FSM) applyPromotePartition(c *PromotePartitionCommand) interface{} {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -150,6 +158,12 @@ func (f *FSM) applyPromotePartition(c *PromotePartitionCommand) interface{} {
 	p := t.Partitions[c.Partition]
 	if p.NodeID == c.NodeID {
 		return p // already the leader: a harmless no-op
+	}
+	if c.Generation != p.Generation+1 {
+		return fmt.Errorf(
+			"stale promote: expected generation %d, %s/%d is at %d",
+			c.Generation, c.Topic, c.Partition, p.Generation,
+		)
 	}
 	idx := -1
 	for i, r := range p.Replicas {
@@ -167,7 +181,9 @@ func (f *FSM) applyPromotePartition(c *PromotePartitionCommand) interface{} {
 			newReplicas = append(newReplicas, r)
 		}
 	}
-	t.Partitions[c.Partition] = PartitionAssignment{Partition: c.Partition, NodeID: c.NodeID, Replicas: newReplicas}
+	t.Partitions[c.Partition] = PartitionAssignment{
+		Partition: c.Partition, NodeID: c.NodeID, Replicas: newReplicas, Generation: c.Generation,
+	}
 	f.topics[c.Topic] = t
 	return t.Partitions[c.Partition]
 }

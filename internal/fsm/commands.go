@@ -34,10 +34,13 @@ type CreateTopicCommand struct {
 
 // PromotePartitionCommand records that NodeID (already promoted on its real
 // broker -- see broker.PromoteToLeader) is now this partition's leader.
+// Generation must be exactly the partition's current Generation+1, the
+// fencing guard against a stale or duplicate promote applying out of order.
 type PromotePartitionCommand struct {
-	Topic     string `json:"topic"`
-	Partition uint32 `json:"partition"`
-	NodeID    string `json:"node_id"`
+	Topic      string `json:"topic"`
+	Partition  uint32 `json:"partition"`
+	NodeID     string `json:"node_id"`
+	Generation uint64 `json:"generation"`
 }
 
 // AddNodeCommand registers a node (and its millrace-core address, "" if it

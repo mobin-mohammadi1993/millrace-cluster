@@ -74,11 +74,16 @@ func CreateTopicOwned(addr, name string, partitions uint32, owned []uint32) erro
 
 // PartitionRole is one partition's role to hand a broker via
 // CreateTopicReplica: Leader accepts client writes directly; a Follower
-// (Leader == false) replicates from LeaderAddr instead.
+// (Leader == false) replicates from LeaderAddr instead. Epoch fences stale
+// role changes on the broker (see millrace-core's Topic::promote/demote);
+// Replicas (Leader only) is the partition's total replica count, which the
+// broker uses to compute its ack-quorum majority.
 type PartitionRole struct {
 	Partition  uint32
 	Leader     bool
 	LeaderAddr string // only used when Leader is false
+	Epoch      uint64
+	Replicas   uint32 // only used when Leader is true
 }
 
 // CreateTopicReplica makes the broker serve exactly the listed partitions,
@@ -92,20 +97,44 @@ func CreateTopicReplica(addr, name string, partitions uint32, roles []PartitionR
 		body = binary.LittleEndian.AppendUint32(body, r.Partition)
 		if r.Leader {
 			body = append(body, 0)
+			body = binary.LittleEndian.AppendUint64(body, r.Epoch)
+			body = binary.LittleEndian.AppendUint32(body, r.Replicas)
 		} else {
 			body = append(body, 1)
 			body = binary.LittleEndian.AppendUint16(body, uint16(len(r.LeaderAddr)))
 			body = append(body, r.LeaderAddr...)
+			body = binary.LittleEndian.AppendUint64(body, r.Epoch)
 		}
 	}
 	return createErr(roundTrip(addr, body))
 }
 
-// PromoteToLeader turns a Follower partition on this broker into a Leader
-// (op 10) -- the manual failover primitive; a no-op if already Leader.
-func PromoteToLeader(addr, topic string, partition uint32) error {
+// PromoteToLeader turns a Follower partition on this broker into a Leader at
+// epoch (op 10) -- the manual failover primitive; a no-op if already Leader
+// at exactly this epoch (retry-safe), rejected if epoch isn't strictly
+// newer than the partition's current epoch (stale). replicas is the
+// partition's total replica count, for this new leader's own quorum math.
+func PromoteToLeader(addr, topic string, partition uint32, epoch uint64, replicas uint32) error {
 	body := nameBody(10, topic)
 	body = binary.LittleEndian.AppendUint32(body, partition)
+	body = binary.LittleEndian.AppendUint64(body, epoch)
+	body = binary.LittleEndian.AppendUint32(body, replicas)
+	_, err := roundTrip(addr, body)
+	return err
+}
+
+// DemoteToFollower turns a partition into a Follower of leaderAddr at epoch
+// (op 11) -- the fencing half of a promote: called on the *old* leader right
+// after promoting a replica, so it stops accepting writes instead of
+// risking split-brain. Rejected if epoch isn't strictly newer than the
+// partition's current epoch; a no-op if already a Follower of exactly this
+// leader at exactly this epoch (retry-safe).
+func DemoteToFollower(addr, topic string, partition uint32, leaderAddr string, epoch uint64) error {
+	body := nameBody(11, topic)
+	body = binary.LittleEndian.AppendUint32(body, partition)
+	body = binary.LittleEndian.AppendUint16(body, uint16(len(leaderAddr)))
+	body = append(body, leaderAddr...)
+	body = binary.LittleEndian.AppendUint64(body, epoch)
 	_, err := roundTrip(addr, body)
 	return err
 }
@@ -149,10 +178,15 @@ func Mirror(addr, nodeID string, f *fsm.FSM) func(fsm.TopicInfo) {
 		for _, p := range t.Partitions {
 			switch {
 			case p.NodeID == nodeID:
-				roles = append(roles, PartitionRole{Partition: p.Partition, Leader: true})
+				roles = append(roles, PartitionRole{
+					Partition: p.Partition, Leader: true,
+					Epoch: p.Generation, Replicas: uint32(1 + len(p.Replicas)),
+				})
 			case isReplica(p.Replicas, nodeID):
 				leaderAddr, _ := f.NodeBroker(p.NodeID)
-				roles = append(roles, PartitionRole{Partition: p.Partition, LeaderAddr: leaderAddr})
+				roles = append(roles, PartitionRole{
+					Partition: p.Partition, LeaderAddr: leaderAddr, Epoch: p.Generation,
+				})
 			}
 		}
 		err := CreateTopicReplica(addr, t.Name, uint32(len(t.Partitions)), roles)
