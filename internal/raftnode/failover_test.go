@@ -10,11 +10,21 @@ import (
 	"millrace-cluster/internal/raftnode"
 )
 
+// nodesMap seeds an FSM's membership with these ids and no broker address --
+// enough for round-robin placement, when the test doesn't care about routing.
+func nodesMap(ids []string) map[string]string {
+	m := make(map[string]string, len(ids))
+	for _, id := range ids {
+		m[id] = ""
+	}
+	return m
+}
+
 // startTestNode brings up one real raft.Raft node (real TCP transport on
 // localhost, real file snapshot store) -- not a mock.
 func startTestNode(t *testing.T, id, addr string, peers []raft.Server, peerIDs []string) (*raft.Raft, *fsm.FSM) {
 	t.Helper()
-	f := fsm.New(peerIDs)
+	f := fsm.New(nodesMap(peerIDs))
 	r, err := raftnode.Start(f, raftnode.Config{
 		NodeID:   id,
 		BindAddr: addr,

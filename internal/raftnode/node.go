@@ -1,5 +1,7 @@
 // Package raftnode wires up one hashicorp/raft node: TCP transport, file
-// snapshot store, and a static (bootstrap-time) cluster configuration.
+// snapshot store, and either a static bootstrap configuration or -- if
+// Config.Peers is left empty -- a blank start for a node that will join an
+// existing cluster.
 package raftnode
 
 import (
@@ -15,10 +17,11 @@ type Config struct {
 	NodeID   string
 	BindAddr string
 	DataDir  string
-	// Peers is the full, static cluster configuration -- identical on
-	// every node -- used only at bootstrap. Membership changes after
-	// bootstrap (dynamic join/leave) are not implemented yet; see the
-	// README's "honest limitations".
+	// Peers is the full, static cluster configuration -- identical on every
+	// node -- used only to bootstrap a brand-new cluster. Leave it empty for
+	// a node joining an existing cluster (cmd/millrace-cluster --join): it
+	// starts blank and waits for the leader to add it via raft.AddVoter,
+	// which replicates the real configuration to it automatically.
 	Peers []raft.Server
 }
 
@@ -66,7 +69,7 @@ func Start(fsm raft.FSM, cfg Config) (*raft.Raft, error) {
 	if err != nil {
 		return nil, err
 	}
-	if !hasState {
+	if !hasState && len(cfg.Peers) > 0 {
 		future := r.BootstrapCluster(raft.Configuration{Servers: cfg.Peers})
 		if err := future.Error(); err != nil {
 			return nil, fmt.Errorf("bootstrapping cluster: %w", err)

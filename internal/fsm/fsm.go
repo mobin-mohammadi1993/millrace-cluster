@@ -23,14 +23,15 @@ type TopicInfo struct {
 	Partitions []PartitionAssignment `json:"partitions"`
 }
 
-// FSM assigns partitions round-robin over nodeIDs, which every node in the
-// cluster was started with identically (see cmd/millrace-cluster's static
-// --peers flag) -- so placement is deterministic across replicas without
-// node membership itself needing to go through the replicated log.
+// FSM assigns partitions round-robin over its live node set. That set is
+// itself replicated cluster state (AddNode/RemoveNode), not a fixed
+// construction-time list, so a node added or removed after bootstrap
+// affects placement for every *topic created after* the change -- existing
+// topics' assignments never move (see the "no rebalancing" limitation).
 type FSM struct {
-	mu      sync.RWMutex
-	nodeIDs []string
-	topics  map[string]TopicInfo
+	mu     sync.RWMutex
+	nodes  map[string]string // node id -> millrace-core address ("" if none)
+	topics map[string]TopicInfo
 
 	// OnTopicCreated, if set before the node starts, is called (in its own
 	// goroutine) each time a CreateTopic is applied on this node. Not called
@@ -38,11 +39,17 @@ type FSM struct {
 	OnTopicCreated func(TopicInfo)
 }
 
-func New(nodeIDs []string) *FSM {
-	ids := make([]string, len(nodeIDs))
-	copy(ids, nodeIDs)
-	sort.Strings(ids)
-	return &FSM{nodeIDs: ids, topics: make(map[string]TopicInfo)}
+// New seeds the initial membership. Every node must be started with the same
+// seed at first bootstrap; a node joining afterwards should instead fetch the
+// live set from an existing member (see cmd/millrace-cluster --join) since
+// the original bootstrap membership is never itself replicated through the
+// Raft log -- only changes made via AddNode/RemoveNode are.
+func New(nodes map[string]string) *FSM {
+	seed := make(map[string]string, len(nodes))
+	for id, addr := range nodes {
+		seed[id] = addr
+	}
+	return &FSM{nodes: seed, topics: make(map[string]TopicInfo)}
 }
 
 func (f *FSM) Apply(log *raft.Log) interface{} {
@@ -53,6 +60,16 @@ func (f *FSM) Apply(log *raft.Log) interface{} {
 	switch cmd.Type {
 	case CommandCreateTopic:
 		return f.applyCreateTopic(cmd.CreateTopic)
+	case CommandAddNode:
+		f.mu.Lock()
+		f.nodes[cmd.AddNode.NodeID] = cmd.AddNode.BrokerAddr
+		f.mu.Unlock()
+		return nil
+	case CommandRemoveNode:
+		f.mu.Lock()
+		delete(f.nodes, cmd.RemoveNode.NodeID)
+		f.mu.Unlock()
+		return nil
 	default:
 		return fmt.Errorf("unknown command type %q", cmd.Type)
 	}
@@ -68,10 +85,19 @@ func (f *FSM) applyCreateTopic(c *CreateTopicCommand) interface{} {
 	if c.NumPartitions == 0 {
 		return fmt.Errorf("num_partitions must be >= 1")
 	}
+	if len(f.nodes) == 0 {
+		return fmt.Errorf("no nodes to place partitions on")
+	}
+
+	nodeIDs := make([]string, 0, len(f.nodes))
+	for id := range f.nodes {
+		nodeIDs = append(nodeIDs, id)
+	}
+	sort.Strings(nodeIDs)
 
 	partitions := make([]PartitionAssignment, c.NumPartitions)
 	for i := uint32(0); i < c.NumPartitions; i++ {
-		node := f.nodeIDs[int(i)%len(f.nodeIDs)]
+		node := nodeIDs[int(i)%len(nodeIDs)]
 		partitions[i] = PartitionAssignment{Partition: i, NodeID: node}
 	}
 	topic := TopicInfo{Name: c.Name, Partitions: partitions}
@@ -80,6 +106,26 @@ func (f *FSM) applyCreateTopic(c *CreateTopicCommand) interface{} {
 		go f.OnTopicCreated(topic)
 	}
 	return topic
+}
+
+// Nodes is a direct (non-Raft-log) read of this node's current membership:
+// node id -> millrace-core address. Safe on a follower, which may lag.
+func (f *FSM) Nodes() map[string]string {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+	out := make(map[string]string, len(f.nodes))
+	for id, addr := range f.nodes {
+		out[id] = addr
+	}
+	return out
+}
+
+// NodeBroker returns one node's millrace-core address, if it's a member.
+func (f *FSM) NodeBroker(id string) (string, bool) {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+	addr, ok := f.nodes[id]
+	return addr, ok
 }
 
 func (f *FSM) Topic(name string) (TopicInfo, bool) {
@@ -103,22 +149,33 @@ func (f *FSM) ListTopics() []TopicInfo {
 	return out
 }
 
+type snapshotState struct {
+	Topics map[string]TopicInfo `json:"topics"`
+	Nodes  map[string]string    `json:"nodes"`
+}
+
 type fsmSnapshot struct {
-	topics map[string]TopicInfo
+	state snapshotState
 }
 
 func (f *FSM) Snapshot() (raft.FSMSnapshot, error) {
 	f.mu.RLock()
 	defer f.mu.RUnlock()
-	topicsCopy := make(map[string]TopicInfo, len(f.topics))
-	for k, v := range f.topics {
-		topicsCopy[k] = v
+	state := snapshotState{
+		Topics: make(map[string]TopicInfo, len(f.topics)),
+		Nodes:  make(map[string]string, len(f.nodes)),
 	}
-	return &fsmSnapshot{topics: topicsCopy}, nil
+	for k, v := range f.topics {
+		state.Topics[k] = v
+	}
+	for k, v := range f.nodes {
+		state.Nodes[k] = v
+	}
+	return &fsmSnapshot{state: state}, nil
 }
 
 func (s *fsmSnapshot) Persist(sink raft.SnapshotSink) error {
-	data, err := json.Marshal(s.topics)
+	data, err := json.Marshal(s.state)
 	if err != nil {
 		sink.Cancel()
 		return err
@@ -134,12 +191,13 @@ func (s *fsmSnapshot) Release() {}
 
 func (f *FSM) Restore(rc io.ReadCloser) error {
 	defer rc.Close()
-	var topics map[string]TopicInfo
-	if err := json.NewDecoder(rc).Decode(&topics); err != nil {
+	var state snapshotState
+	if err := json.NewDecoder(rc).Decode(&state); err != nil {
 		return err
 	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	f.topics = topics
+	f.topics = state.Topics
+	f.nodes = state.Nodes
 	return nil
 }
