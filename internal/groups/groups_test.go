@@ -2,6 +2,7 @@ package groups
 
 import (
 	"reflect"
+	"sort"
 	"testing"
 	"time"
 )
@@ -33,8 +34,9 @@ func TestMembershipAssignmentAndEviction(t *testing.T) {
 	}
 	ha, _ := c.Heartbeat("t", "g", a.Member, parts)
 	hb, _ := c.Heartbeat("t", "g", b.Member, parts)
-	// Round-robin over sorted ids: m-1 gets 0,2,4 and m-2 gets 1,3.
-	if !reflect.DeepEqual(ha.Partitions, []uint32{0, 2, 4}) || !reflect.DeepEqual(hb.Partitions, []uint32{1, 3}) || ha.Generation != 2 {
+	// Sticky: a already had all 5, so it keeps its lowest 3 (its fair share)
+	// and only the 2 freed from it move to b -- not a full round-robin reshuffle.
+	if !reflect.DeepEqual(ha.Partitions, []uint32{0, 1, 2}) || !reflect.DeepEqual(hb.Partitions, []uint32{3, 4}) || ha.Generation != 2 {
 		t.Fatalf("split wrong: a=%+v b=%+v", ha, hb)
 	}
 
@@ -82,9 +84,11 @@ func TestDescribeListsLiveGroupsOfOneTopic(t *testing.T) {
 	c.Join("t", "audit", "solo", 3)
 	c.Join("other", "workers", "x", 3) // a different topic never shows up
 
+	// bob joined first (got everything), then amy: sticky keeps bob's lowest
+	// partition and moves the rest amy's way to reach a 2/1 fair split.
 	want := []GroupInfo{
 		{"audit", 1, []MemberInfo{{"solo", []uint32{0, 1, 2}}}},
-		{"workers", 2, []MemberInfo{{"amy", []uint32{0, 2}}, {"bob", []uint32{1}}}},
+		{"workers", 2, []MemberInfo{{"amy", []uint32{1, 2}}, {"bob", []uint32{0}}}},
 	}
 	if got := c.Describe("t", 3); !reflect.DeepEqual(got, want) {
 		t.Fatalf("got  %+v\nwant %+v", got, want)
@@ -123,15 +127,16 @@ func TestAuthorizeFencesCommits(t *testing.T) {
 		t.Fatalf("non-member: %v", err)
 	}
 
-	// B joins: A keeps 0,2 and B gets 1,3. A hasn't heartbeated, but the
-	// coordinator already refuses A's commits for partitions it lost.
+	// B joins: sticky keeps A's lowest 2 (0,1) and B gets the 2 freed from A
+	// (2,3). A hasn't heartbeated, but the coordinator already refuses A's
+	// commits for the partitions it lost.
 	b := c.Join("t", "g", "", parts)
-	for p, want := range map[uint32]error{0: nil, 2: nil, 1: ErrNotAssigned, 3: ErrNotAssigned} {
+	for p, want := range map[uint32]error{0: nil, 1: nil, 2: ErrNotAssigned, 3: ErrNotAssigned} {
 		if err := c.Authorize("t", "g", a.Member, p, parts); err != want {
 			t.Errorf("A on partition %d: got %v, want %v", p, err, want)
 		}
 	}
-	if err := c.Authorize("t", "g", b.Member, 1, parts); err != nil {
+	if err := c.Authorize("t", "g", b.Member, 2, parts); err != nil {
 		t.Errorf("B on its own partition: %v", err)
 	}
 
@@ -152,6 +157,49 @@ func TestAuthorizeFencesCommits(t *testing.T) {
 	*now = now.Add(11 * time.Second)
 	if err := c.Authorize("t", "g", a.Member, 0, parts); err != ErrUnknownMember {
 		t.Errorf("silent member should time out even if it only commits: %v", err)
+	}
+}
+
+// The actual point of stickiness: when a member leaves, only *its* partitions
+// get redistributed. Members who kept heartbeating never lose a partition
+// they already had, even though a from-scratch round-robin recompute would
+// have reshuffled everything.
+func TestAssignmentIsStickyAcrossMembershipChanges(t *testing.T) {
+	c := New(time.Minute)
+	fakeClock(c)
+	const parts = 6
+
+	a := c.Join("t", "g", "", parts) // alone: {0,1,2,3,4,5}
+	b := c.Join("t", "g", "", parts) // a->{0,1,2}, b->{3,4,5}
+	ha, _ := c.Heartbeat("t", "g", a.Member, parts)
+	hb, _ := c.Heartbeat("t", "g", b.Member, parts)
+	if !reflect.DeepEqual(ha.Partitions, []uint32{0, 1, 2}) || !reflect.DeepEqual(hb.Partitions, []uint32{3, 4, 5}) {
+		t.Fatalf("setup: a=%v b=%v", ha.Partitions, hb.Partitions)
+	}
+	cc := c.Join("t", "g", "", parts) // third member takes 1 from each of a and b
+	ha, _ = c.Heartbeat("t", "g", a.Member, parts)
+	hb, _ = c.Heartbeat("t", "g", b.Member, parts)
+	hc, _ := c.Heartbeat("t", "g", cc.Member, parts)
+	if !reflect.DeepEqual(ha.Partitions, []uint32{0, 1}) || !reflect.DeepEqual(hb.Partitions, []uint32{3, 4}) || !reflect.DeepEqual(hc.Partitions, []uint32{2, 5}) {
+		t.Fatalf("3-way split: a=%v b=%v c=%v", ha.Partitions, hb.Partitions, hc.Partitions)
+	}
+
+	// b leaves. a and c must keep exactly what they had (0,1 and 2,5) --
+	// only b's old {3,4} may move.
+	c.Leave("t", "g", b.Member)
+	ha, _ = c.Heartbeat("t", "g", a.Member, parts)
+	hc, _ = c.Heartbeat("t", "g", cc.Member, parts)
+	if !reflect.DeepEqual(ha.Partitions, []uint32{0, 1, 3}) {
+		t.Errorf("a should keep {0,1} and gain one of b's: got %v", ha.Partitions)
+	}
+	if !reflect.DeepEqual(hc.Partitions, []uint32{2, 4, 5}) {
+		t.Errorf("c should keep {2,5} and gain one of b's: got %v", hc.Partitions)
+	}
+
+	all := append(append([]uint32{}, ha.Partitions...), hc.Partitions...)
+	sort.Slice(all, func(i, j int) bool { return all[i] < all[j] })
+	if !reflect.DeepEqual(all, []uint32{0, 1, 2, 3, 4, 5}) {
+		t.Fatalf("partitions lost or duplicated after leave: %v", all)
 	}
 }
 

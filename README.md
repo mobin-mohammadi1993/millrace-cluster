@@ -58,10 +58,12 @@ reaching for "implement everything from scratch" as the portfolio flex.
   `millrace-sdk`'s `RoutedClient` uses it to send each produce/fetch to the
   broker that owns the partition.
 - **`internal/groups`** + `POST /groups/{join,heartbeat,leave}` — the
-  consumer-group coordinator. Members of a `(topic, group)` are given
-  partitions round-robin over their sorted ids; every membership change bumps
-  a generation; a member silent for `--group-session-timeout` (default 10s) is
-  evicted. `join` returns `{member, generation, partitions}`; `heartbeat`
+  consumer-group coordinator. A `(topic, group)`'s partitions are shared
+  fairly (within one of each other) across its live members, **sticky**: a
+  join or leave only moves the partitions it has to (freed from a member who
+  left, or taken from whoever is over their fair share), not a full
+  from-scratch reshuffle. Every membership change bumps a generation; a member
+  silent for `--group-session-timeout` (default 10s) is evicted. `join` returns `{member, generation, partitions}`; `heartbeat`
   returns the same (or 404 if the member is unknown: re-join). Leader only,
   409 otherwise. `millrace-sdk`'s `GroupConsumer` drives it. `GET
   /groups?topic=T` lists the topic's groups that have live members — each
@@ -78,9 +80,10 @@ reaching for "implement everything from scratch" as the portfolio flex.
   replicated (they'd swamp the log). After a leader change the new leader
   knows no members, so each gets 404, re-joins under its old id and resumes
   from its broker-side commits — a brief rebalance, no lost progress, but
-  possible re-delivery. Groups are never garbage-collected, and assignment is
-  plain round-robin (no stickiness, so a membership change can move more
-  partitions than necessary).
+  possible re-delivery. Groups are never garbage-collected, and assignment
+  balances by count only — it doesn't know which partitions are expensive to
+  re-warm, so "sticky" means "moves the fewest partitions", not "moves the
+  cheapest ones".
 - **Commit fencing has limits.** It covers commits sent through
   `POST /groups/commit` (what `GroupConsumer` uses); brokers know nothing about
   membership, so a client that commits to a broker directly (`Consumer(group=…)`,
@@ -170,11 +173,13 @@ queried directly, asserting the owner has the record and every other broker
 rejects both a fetch and a produce for that partition ("not owned").
 
 `internal/groups/groups_test.go` unit-tests the coordinator on a fake clock:
-generation bumps, exact round-robin splits, eviction after the timeout,
+generation bumps, exact fair-share splits, eviction after the timeout,
 re-join under the old id, leave, group/topic isolation, more members than
-partitions, `Describe` (only groups with live members, sorted, one topic), and
+partitions, `Describe` (only groups with live members, sorted, one topic),
 `Authorize` (owner allowed; stranger, evicted member and a partition lost to a
-rebalance all refused; a commit alone doesn't keep a session alive). The whole group flow is tested end to end from `millrace-sdk`
+rebalance all refused; a commit alone doesn't keep a session alive), and
+stickiness itself: after a 3-way split, one member leaving moves only its own
+partitions — the other two members' assignments are asserted unchanged. The whole group flow is tested end to end from `millrace-sdk`
 (`test_consumer_group_splits_partitions_and_rebalances`) against three real
 cluster processes and three real brokers — see that README.
 
