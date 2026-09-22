@@ -49,8 +49,12 @@ func (s *Server) CreateTopic(ctx context.Context, req *pb.CreateTopicRequest) (*
 	}
 
 	cmd := fsm.Command{
-		Type:        fsm.CommandCreateTopic,
-		CreateTopic: &fsm.CreateTopicCommand{Name: req.Name, NumPartitions: req.NumPartitions},
+		Type: fsm.CommandCreateTopic,
+		CreateTopic: &fsm.CreateTopicCommand{
+			Name:              req.Name,
+			NumPartitions:     req.NumPartitions,
+			ReplicationFactor: req.ReplicationFactor,
+		},
 	}
 	data, err := cmd.Encode()
 	if err != nil {
@@ -89,6 +93,7 @@ func toProtoTopic(t fsm.TopicInfo, brokers map[string]string) *pb.TopicInfo {
 			Partition:  p.Partition,
 			NodeId:     p.NodeID,
 			BrokerAddr: brokers[p.NodeID],
+			ReplicaIds: p.Replicas,
 		})
 	}
 	return pt

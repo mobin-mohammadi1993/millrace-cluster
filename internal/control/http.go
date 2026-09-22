@@ -20,8 +20,13 @@ import (
 // gRPC stack just to ask "where does this partition live?".
 //
 //	GET  /route?topic=T&partition=P  -> {"node_id": ..., "broker_addr": ..., "partitions": <count in T>}
-//	POST /topics {"name":..,"partitions":N} -> 201, or 409 {"error": ...}
-//	     (409 includes "not leader" -- POST to another node)
+//	     (node_id/broker_addr are the partition's current leader)
+//	POST /topics {"name":..,"partitions":N,"replication_factor":R} -> 201, or 409 {"error": ...}
+//	     (409 includes "not leader" -- POST to another node; replication_factor
+//	     0 or 1 means no replication, the pre-existing behavior)
+//	POST /partitions/promote {"topic","partition","node_id"} -> {} (leader only, 409 otherwise)
+//	     manual failover: promotes node_id (must be a current replica) to leader for
+//	     that partition; does not detect or demote a still-alive old leader
 //	GET  /groups?topic=T -> {"groups":[{"group","generation","members":[{"member","partitions"}]}]}
 //	     (groups with live members only; leader only, 409 otherwise)
 //	POST /groups/{join,heartbeat,leave} {"topic","group","member"} -> {"member","generation","partitions"}
@@ -58,14 +63,19 @@ func (s *Server) HTTPHandler() http.Handler {
 
 	mux.HandleFunc("POST /topics", func(w http.ResponseWriter, r *http.Request) {
 		var body struct {
-			Name       string `json:"name"`
-			Partitions uint32 `json:"partitions"`
+			Name              string `json:"name"`
+			Partitions        uint32 `json:"partitions"`
+			ReplicationFactor uint32 `json:"replication_factor"`
 		}
 		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 			writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
 			return
 		}
-		resp, err := s.CreateTopic(r.Context(), &pb.CreateTopicRequest{Name: body.Name, NumPartitions: body.Partitions})
+		resp, err := s.CreateTopic(r.Context(), &pb.CreateTopicRequest{
+			Name:              body.Name,
+			NumPartitions:     body.Partitions,
+			ReplicationFactor: body.ReplicationFactor,
+		})
 		if err != nil {
 			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
 			return
@@ -75,6 +85,47 @@ func (s *Server) HTTPHandler() http.Handler {
 			return
 		}
 		writeJSON(w, http.StatusCreated, resp.Topic)
+	})
+
+	// Manual failover: promote a follower to leader. Callers pick the node
+	// (typically because the current leader is unreachable); this does NOT
+	// detect a dead leader or demote/fence it -- the operator is responsible
+	// for that, per the "manual failover only" scope (see README).
+	mux.HandleFunc("POST /partitions/promote", func(w http.ResponseWriter, r *http.Request) {
+		if s.Raft.State() != raft.Leader {
+			writeJSON(w, http.StatusConflict, map[string]string{"error": "not leader"})
+			return
+		}
+		var body struct {
+			Topic     string `json:"topic"`
+			Partition uint32 `json:"partition"`
+			NodeID    string `json:"node_id"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil || body.Topic == "" || body.NodeID == "" {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "need JSON {topic, partition, node_id}"})
+			return
+		}
+		addr, ok := s.FSM.NodeBroker(body.NodeID)
+		if !ok || addr == "" {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "unknown node or no broker configured for it"})
+			return
+		}
+		// Promote the real broker first: if this fails, the cluster's
+		// metadata is left untouched, so retrying (or trying another node)
+		// is safe. PromoteToLeader is itself a no-op if already leader, so
+		// retrying after a metadata-apply failure below is also safe.
+		if err := broker.PromoteToLeader(addr, body.Topic, body.Partition); err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+			return
+		}
+		cmd := fsm.Command{Type: fsm.CommandPromotePartition, PromotePartition: &fsm.PromotePartitionCommand{
+			Topic: body.Topic, Partition: body.Partition, NodeID: body.NodeID,
+		}}
+		if err := s.applyCommand(cmd); err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]string{})
 	})
 
 	mux.HandleFunc("GET /groups", func(w http.ResponseWriter, r *http.Request) {

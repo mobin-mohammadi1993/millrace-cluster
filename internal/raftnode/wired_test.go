@@ -63,7 +63,7 @@ func TestCommittedTopicIsCreatedOnEveryNodesBroker(t *testing.T) {
 	for _, id := range ids {
 		brokers[id] = startBroker(t)
 		f := fsm.New(nodesMap(ids))
-		f.OnTopicCreated = broker.Mirror(brokers[id], id)
+		f.OnTopicCreated = broker.Mirror(brokers[id], id, f)
 		r, err := raftnode.Start(f, raftnode.Config{
 			NodeID: id, BindAddr: raftAddrs[id], DataDir: t.TempDir(), Peers: servers,
 		})

@@ -89,7 +89,7 @@ func main() {
 		ownBroker, _ = f.NodeBroker(*nodeID)
 	}
 	if ownBroker != "" {
-		f.OnTopicCreated = broker.Mirror(ownBroker, *nodeID)
+		f.OnTopicCreated = broker.Mirror(ownBroker, *nodeID, f)
 	}
 
 	r, err := raftnode.Start(f, raftnode.Config{

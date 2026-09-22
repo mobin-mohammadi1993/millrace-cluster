@@ -16,6 +16,9 @@ service Control {
 message CreateTopicRequest {
   string name = 1;
   uint32 num_partitions = 2;
+  // 0 or 1 = no replication (one leader, no followers) -- the pre-existing
+  // behavior. Must not exceed the current live node count.
+  uint32 replication_factor = 3;
 }
 
 message CreateTopicResponse {
@@ -28,10 +31,14 @@ message CreateTopicResponse {
 
 message PartitionAssignment {
   uint32 partition = 1;
+  // The leader's node id -- the only replica that accepts client writes.
   string node_id = 2;
-  // The owning node's millrace-core address; empty if that node has no
+  // The leader's millrace-core address; empty if that node has no
   // --brokers entry.
   string broker_addr = 3;
+  // Follower node ids replicating this partition from the leader; empty
+  // when the topic wasn't created with a replication_factor > 1.
+  repeated string replica_ids = 4;
 }
 
 message TopicInfo {

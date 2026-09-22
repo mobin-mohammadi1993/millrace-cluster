@@ -37,7 +37,13 @@ reaching for "implement everything from scratch" as the portfolio flex.
   assigns partitions round-robin over whoever is a live member **at that
   moment** — a node added or removed after bootstrap changes placement for
   topics created *after* the change; existing topics never move (see
-  "honest limitations").
+  "honest limitations"). `CreateTopic` takes a `replication_factor`: `0`/`1`
+  keeps the old single-owner behavior, and `N` picks a leader plus `N-1`
+  followers per partition (round-robin, distinct nodes since `N` can't
+  exceed the live node count). `PromotePartition` is the manual-failover
+  command: it swaps a partition's leader for a current replica and drops the
+  old leader from the replica set (it does not contact or demote that old
+  leader -- see "honest limitations").
 - **`internal/raftnode`** — wires up one `hashicorp/raft` node: real TCP
   transport, file-backed snapshot store, and either a one-time
   `BootstrapCluster` (static `--peers`, a new cluster) or, if `Peers` is left
@@ -49,8 +55,11 @@ reaching for "implement everything from scratch" as the portfolio flex.
   follower) and `ClusterState` (a direct FSM read; each `PartitionAssignment`
   carries the owning node's `broker_addr` from `--brokers`).
 - **`internal/broker`** — a minimal `millrace-core` client (`CreateTopic`,
-  `DescribeTopic`) and `Mirror`, the FSM hook that creates committed topics on
-  the node's local broker.
+  `CreateTopicReplica`, `PromoteToLeader`, `DescribeTopic`) and `Mirror`, the
+  FSM hook that creates each committed topic on the node's local broker: as
+  Leader for partitions it leads, as Follower (replicating from the leader's
+  own broker address, resolved via the FSM's node map) for partitions where
+  it's a replica.
 - **`cmd/millrace-cluster`** — the node binary. Bootstrap a new cluster with
   `--node-id`, `--raft-addr`, `--grpc-addr`, `--data-dir`, `--peers`, plus
   optional `--brokers` (`id=millrace-core_addr`, same on every node),
@@ -64,10 +73,17 @@ reaching for "implement everything from scratch" as the portfolio flex.
   node has no other way to learn about them.
 - **`internal/control/http.go`** — a stdlib-only JSON API for clients that
   shouldn't need gRPC: `GET /route?topic=T&partition=P` →
-  `{"node_id","broker_addr","partitions"}` (any node can answer; `partitions` is the topic's partition count), and `POST /topics`
-  (leader only; a follower answers 409 "not leader", so try another node).
-  `millrace-sdk`'s `RoutedClient` uses it to send each produce/fetch to the
-  broker that owns the partition.
+  `{"node_id","broker_addr","partitions"}` (any node can answer; `node_id`/`broker_addr`
+  are the partition's current *leader*; `partitions` is the topic's partition
+  count), `POST /topics` (leader only; a follower answers 409 "not leader",
+  so try another node), and `POST /partitions/promote
+  {"topic","partition","node_id"}` (leader only) -- the manual failover
+  primitive: promotes `node_id`'s real broker first (`broker.PromoteToLeader`,
+  safe to retry -- it's a no-op if already leader), then applies
+  `PromotePartition` to update the cluster's metadata to match.
+  `millrace-sdk`'s `RoutedClient` uses `/route` to send each produce/fetch to
+  the broker that owns the partition; `millrace-cli cluster-promote` wraps
+  `/partitions/promote`.
 - **`internal/groups`** + `POST /groups/{join,heartbeat,leave}` — the
   consumer-group coordinator. A `(topic, group)`'s partitions are shared
   fairly (within one of each other) across its live members, **sticky**: a
@@ -143,18 +159,37 @@ reaching for "implement everything from scratch" as the portfolio flex.
   (`raft-boltdb`) are a documented fast-follow, not implemented here.
 - **No auth/TLS** on either the Raft transport or the gRPC control plane —
   matches the trusted-network scope of `millrace-core` at this stage.
-- **Ownership is fixed at topic creation.** With `--brokers`, every node
-  creates each committed topic on its own local `millrace-core` via
-  `CreateTopicOwned`, listing only the partitions the FSM assigned to it; the
-  broker then rejects produce/fetch for the rest, and `/route` tells clients
-  where each partition lives. There is no rebalancing: moving a partition
-  means a new assignment plus data movement, neither of which exists. A broker
-  with no `--brokers` entry (or a topic made with plain `CreateTopic` directly
-  on it) still serves everything. Unowned partitions still preallocate a
-  segment on every broker. Mirroring is async and not retried if a broker is
-  down, so a produce right after `POST /topics` can briefly fail with
-  "unknown topic"; topics restored from a Raft snapshot are not re-mirrored;
-  the Compose file doesn't run brokers yet.
+- **Placement is fixed at topic creation.** With `--brokers`, every node
+  mirrors each committed topic onto its own local `millrace-core` via
+  `CreateTopicReplica`, with a role (Leader or Follower) for every partition
+  the FSM assigned it; the broker rejects produce/fetch for the rest, and
+  `/route` tells clients where each partition's leader lives. There is no
+  automatic rebalancing: moving a partition to a different node (or changing
+  its replication factor) means a new assignment plus real data movement,
+  and this repo only builds the *manual* half of that (`/partitions/promote`
+  swaps who's leader among the *existing* replica set -- it doesn't add a
+  brand-new replica on a different node for an existing topic). A broker
+  with no `--brokers` entry (or a topic made with plain `CreateTopic`
+  directly on it) still serves everything as Leader. Unassigned partitions
+  still preallocate a segment on every broker. Mirroring is async and not
+  retried if a broker is down, so a produce right after `POST /topics` can
+  briefly fail with "unknown topic"; topics restored from a Raft snapshot are
+  not re-mirrored; the Compose file doesn't run brokers yet.
+- **Replication is real but async, and failover is manual only.** A
+  Follower's broker pulls from its Leader's broker over the existing `Fetch`
+  wire op (see `millrace-core/src/replicator.rs`) -- genuine cross-broker
+  data replication, not just metadata -- but there's no ack-quorum: a
+  `Produce` succeeds as soon as the leader durably appends it, before any
+  follower has replicated it, so a leader that dies an instant after
+  acknowledging a write can lose that write even after a promote. Nothing
+  detects a dead leader or triggers a promote automatically; an operator (or
+  a future health-checker, not built here) decides when to call
+  `/partitions/promote`, and that call does **not** fence or contact the old
+  leader -- if it's actually still alive and reachable, both it and the
+  newly-promoted node will accept writes independently (split brain) until
+  someone stops the old one. This is the same trade-off `millrace-core`'s own
+  README names for the broker-level mechanism; this layer just wires it into
+  cluster placement and adds the one-command manual promote.
 
 ## Running a 3-node cluster
 
@@ -236,6 +271,19 @@ all three brokers. The HTTP routing API is tested end to end from
 real brokers, records produced through `RoutedClient`; then every broker is
 queried directly, asserting the owner has the record and every other broker
 rejects both a fetch and a produce for that partition ("not owned").
+
+`internal/raftnode/replication_wired_test.go` is replication's own wired
+proof: two real Raft nodes, each with its own real `millrace-core`
+subprocess, commit a `CreateTopic` with `replication_factor=2`; the test
+waits for `Mirror` to actually create the topic (Leader on one broker,
+Follower on the other) via real `CreateTopicReplica` calls, produces
+directly to the leader's broker over raw TCP, and polls the follower's
+broker until its own end-offset independently reaches the same count —
+proof the data crossed the wire, not just the metadata. It also asserts the
+FSM rejects `PromotePartition` for a node that isn't actually a replica,
+then does a real manual promote (`broker.PromoteToLeader` + FSM
+`PromotePartition`) and checks the promoted node accepts a new write
+directly and the FSM has dropped the old leader from the replica set.
 
 `internal/groups/groups_test.go` unit-tests the coordinator on a fake clock:
 generation bumps, exact fair-share splits, eviction after the timeout,

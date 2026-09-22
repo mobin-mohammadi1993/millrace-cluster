@@ -25,8 +25,11 @@ type CreateTopicRequest struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Name          string                 `protobuf:"bytes,1,opt,name=name,proto3" json:"name,omitempty"`
 	NumPartitions uint32                 `protobuf:"varint,2,opt,name=num_partitions,json=numPartitions,proto3" json:"num_partitions,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	// 0 or 1 = no replication (one leader, no followers) -- the pre-existing
+	// behavior. Must not exceed the current live node count.
+	ReplicationFactor uint32 `protobuf:"varint,3,opt,name=replication_factor,json=replicationFactor,proto3" json:"replication_factor,omitempty"`
+	unknownFields     protoimpl.UnknownFields
+	sizeCache         protoimpl.SizeCache
 }
 
 func (x *CreateTopicRequest) Reset() {
@@ -69,6 +72,13 @@ func (x *CreateTopicRequest) GetName() string {
 func (x *CreateTopicRequest) GetNumPartitions() uint32 {
 	if x != nil {
 		return x.NumPartitions
+	}
+	return 0
+}
+
+func (x *CreateTopicRequest) GetReplicationFactor() uint32 {
+	if x != nil {
+		return x.ReplicationFactor
 	}
 	return 0
 }
@@ -138,10 +148,14 @@ func (x *CreateTopicResponse) GetTopic() *TopicInfo {
 type PartitionAssignment struct {
 	state     protoimpl.MessageState `protogen:"open.v1"`
 	Partition uint32                 `protobuf:"varint,1,opt,name=partition,proto3" json:"partition,omitempty"`
-	NodeId    string                 `protobuf:"bytes,2,opt,name=node_id,json=nodeId,proto3" json:"node_id,omitempty"`
-	// The owning node's millrace-core address; empty if that node has no
+	// The leader's node id -- the only replica that accepts client writes.
+	NodeId string `protobuf:"bytes,2,opt,name=node_id,json=nodeId,proto3" json:"node_id,omitempty"`
+	// The leader's millrace-core address; empty if that node has no
 	// --brokers entry.
-	BrokerAddr    string `protobuf:"bytes,3,opt,name=broker_addr,json=brokerAddr,proto3" json:"broker_addr,omitempty"`
+	BrokerAddr string `protobuf:"bytes,3,opt,name=broker_addr,json=brokerAddr,proto3" json:"broker_addr,omitempty"`
+	// Follower node ids replicating this partition from the leader; empty
+	// when the topic wasn't created with a replication_factor > 1.
+	ReplicaIds    []string `protobuf:"bytes,4,rep,name=replica_ids,json=replicaIds,proto3" json:"replica_ids,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -195,6 +209,13 @@ func (x *PartitionAssignment) GetBrokerAddr() string {
 		return x.BrokerAddr
 	}
 	return ""
+}
+
+func (x *PartitionAssignment) GetReplicaIds() []string {
+	if x != nil {
+		return x.ReplicaIds
+	}
+	return nil
 }
 
 type TopicInfo struct {
@@ -343,19 +364,22 @@ var File_control_proto protoreflect.FileDescriptor
 
 const file_control_proto_rawDesc = "" +
 	"\n" +
-	"\rcontrol.proto\x12\acontrol\"O\n" +
+	"\rcontrol.proto\x12\acontrol\"~\n" +
 	"\x12CreateTopicRequest\x12\x12\n" +
 	"\x04name\x18\x01 \x01(\tR\x04name\x12%\n" +
-	"\x0enum_partitions\x18\x02 \x01(\rR\rnumPartitions\"e\n" +
+	"\x0enum_partitions\x18\x02 \x01(\rR\rnumPartitions\x12-\n" +
+	"\x12replication_factor\x18\x03 \x01(\rR\x11replicationFactor\"e\n" +
 	"\x13CreateTopicResponse\x12\x0e\n" +
 	"\x02ok\x18\x01 \x01(\bR\x02ok\x12\x14\n" +
 	"\x05error\x18\x02 \x01(\tR\x05error\x12(\n" +
-	"\x05topic\x18\x03 \x01(\v2\x12.control.TopicInfoR\x05topic\"m\n" +
+	"\x05topic\x18\x03 \x01(\v2\x12.control.TopicInfoR\x05topic\"\x8e\x01\n" +
 	"\x13PartitionAssignment\x12\x1c\n" +
 	"\tpartition\x18\x01 \x01(\rR\tpartition\x12\x17\n" +
 	"\anode_id\x18\x02 \x01(\tR\x06nodeId\x12\x1f\n" +
 	"\vbroker_addr\x18\x03 \x01(\tR\n" +
-	"brokerAddr\"]\n" +
+	"brokerAddr\x12\x1f\n" +
+	"\vreplica_ids\x18\x04 \x03(\tR\n" +
+	"replicaIds\"]\n" +
 	"\tTopicInfo\x12\x12\n" +
 	"\x04name\x18\x01 \x01(\tR\x04name\x12<\n" +
 	"\n" +

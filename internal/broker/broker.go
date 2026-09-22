@@ -72,6 +72,44 @@ func CreateTopicOwned(addr, name string, partitions uint32, owned []uint32) erro
 	return createErr(roundTrip(addr, body))
 }
 
+// PartitionRole is one partition's role to hand a broker via
+// CreateTopicReplica: Leader accepts client writes directly; a Follower
+// (Leader == false) replicates from LeaderAddr instead.
+type PartitionRole struct {
+	Partition  uint32
+	Leader     bool
+	LeaderAddr string // only used when Leader is false
+}
+
+// CreateTopicReplica makes the broker serve exactly the listed partitions,
+// each with an explicit role (op 9) -- the replication-aware sibling of
+// CreateTopicOwned, where every owned partition is implicitly a leader.
+func CreateTopicReplica(addr, name string, partitions uint32, roles []PartitionRole) error {
+	body := nameBody(9, name)
+	body = binary.LittleEndian.AppendUint32(body, partitions)
+	body = binary.LittleEndian.AppendUint32(body, uint32(len(roles)))
+	for _, r := range roles {
+		body = binary.LittleEndian.AppendUint32(body, r.Partition)
+		if r.Leader {
+			body = append(body, 0)
+		} else {
+			body = append(body, 1)
+			body = binary.LittleEndian.AppendUint16(body, uint16(len(r.LeaderAddr)))
+			body = append(body, r.LeaderAddr...)
+		}
+	}
+	return createErr(roundTrip(addr, body))
+}
+
+// PromoteToLeader turns a Follower partition on this broker into a Leader
+// (op 10) -- the manual failover primitive; a no-op if already Leader.
+func PromoteToLeader(addr, topic string, partition uint32) error {
+	body := nameBody(10, topic)
+	body = binary.LittleEndian.AppendUint32(body, partition)
+	_, err := roundTrip(addr, body)
+	return err
+}
+
 // CommitOffset records a consumer group's committed offset on the broker that
 // owns the partition (the broker rejects an offset past the end of the log).
 func CommitOffset(addr, topic string, partition uint32, group string, offset uint64) error {
@@ -101,19 +139,34 @@ func DescribeTopic(addr, name string) (int, error) {
 }
 
 // Mirror returns an fsm.FSM.OnTopicCreated hook that creates each committed
-// topic on the broker at addr, owning only the partitions the FSM assigned to
-// nodeID. Runs async so a dead broker can't stall Raft.
-func Mirror(addr, nodeID string) func(fsm.TopicInfo) {
+// topic on the broker at addr: as Leader for partitions the FSM assigned
+// nodeID as leader, as Follower (replicating from the leader's own broker)
+// for partitions where nodeID is a replica, and absent from every other
+// partition. Runs async so a dead broker can't stall Raft.
+func Mirror(addr, nodeID string, f *fsm.FSM) func(fsm.TopicInfo) {
 	return func(t fsm.TopicInfo) {
-		owned := []uint32{}
+		var roles []PartitionRole
 		for _, p := range t.Partitions {
-			if p.NodeID == nodeID {
-				owned = append(owned, p.Partition)
+			switch {
+			case p.NodeID == nodeID:
+				roles = append(roles, PartitionRole{Partition: p.Partition, Leader: true})
+			case isReplica(p.Replicas, nodeID):
+				leaderAddr, _ := f.NodeBroker(p.NodeID)
+				roles = append(roles, PartitionRole{Partition: p.Partition, LeaderAddr: leaderAddr})
 			}
 		}
-		err := CreateTopicOwned(addr, t.Name, uint32(len(t.Partitions)), owned)
+		err := CreateTopicReplica(addr, t.Name, uint32(len(t.Partitions)), roles)
 		if err != nil && !errors.Is(err, ErrExists) {
 			log.Printf("broker %s: mirroring topic %q failed (not retried): %v", addr, t.Name, err)
 		}
 	}
+}
+
+func isReplica(replicas []string, nodeID string) bool {
+	for _, r := range replicas {
+		if r == nodeID {
+			return true
+		}
+	}
+	return false
 }

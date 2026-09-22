@@ -15,7 +15,11 @@ import (
 
 type PartitionAssignment struct {
 	Partition uint32 `json:"partition"`
-	NodeID    string `json:"node_id"`
+	// The leader's node id -- the only replica that accepts client writes.
+	NodeID string `json:"node_id"`
+	// Follower node ids replicating from the leader; empty unless the topic
+	// was created with a replication_factor > 1.
+	Replicas []string `json:"replicas,omitempty"`
 }
 
 type TopicInfo struct {
@@ -60,6 +64,8 @@ func (f *FSM) Apply(log *raft.Log) interface{} {
 	switch cmd.Type {
 	case CommandCreateTopic:
 		return f.applyCreateTopic(cmd.CreateTopic)
+	case CommandPromotePartition:
+		return f.applyPromotePartition(cmd.PromotePartition)
 	case CommandAddNode:
 		f.mu.Lock()
 		f.nodes[cmd.AddNode.NodeID] = cmd.AddNode.BrokerAddr
@@ -88,6 +94,13 @@ func (f *FSM) applyCreateTopic(c *CreateTopicCommand) interface{} {
 	if len(f.nodes) == 0 {
 		return fmt.Errorf("no nodes to place partitions on")
 	}
+	rf := c.ReplicationFactor
+	if rf == 0 {
+		rf = 1
+	}
+	if int(rf) > len(f.nodes) {
+		return fmt.Errorf("replication_factor %d exceeds %d live node(s)", rf, len(f.nodes))
+	}
 
 	nodeIDs := make([]string, 0, len(f.nodes))
 	for id := range f.nodes {
@@ -95,10 +108,18 @@ func (f *FSM) applyCreateTopic(c *CreateTopicCommand) interface{} {
 	}
 	sort.Strings(nodeIDs)
 
+	// Leader for partition i is nodeIDs[i % n]; its rf-1 followers are the
+	// next rf-1 nodes round-robin from there -- distinct from the leader and
+	// each other since rf <= n.
 	partitions := make([]PartitionAssignment, c.NumPartitions)
 	for i := uint32(0); i < c.NumPartitions; i++ {
-		node := nodeIDs[int(i)%len(nodeIDs)]
-		partitions[i] = PartitionAssignment{Partition: i, NodeID: node}
+		n := len(nodeIDs)
+		leader := nodeIDs[int(i)%n]
+		var replicas []string
+		for r := uint32(1); r < rf; r++ {
+			replicas = append(replicas, nodeIDs[(int(i)+int(r))%n])
+		}
+		partitions[i] = PartitionAssignment{Partition: i, NodeID: leader, Replicas: replicas}
 	}
 	topic := TopicInfo{Name: c.Name, Partitions: partitions}
 	f.topics[c.Name] = topic
@@ -106,6 +127,49 @@ func (f *FSM) applyCreateTopic(c *CreateTopicCommand) interface{} {
 		go f.OnTopicCreated(topic)
 	}
 	return topic
+}
+
+// applyPromotePartition records that c.NodeID is now the partition's leader,
+// after the caller has already promoted it on the real broker (see
+// broker.PromoteToLeader) -- this only updates the cluster's metadata to
+// match. The old leader is dropped from the replica set rather than kept as
+// a (possibly false) follower entry: this command doesn't contact or demote
+// it, so the caller is responsible for making sure it's actually down or
+// otherwise no longer serving writes (manual failover, not automatic).
+func (f *FSM) applyPromotePartition(c *PromotePartitionCommand) interface{} {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	t, ok := f.topics[c.Topic]
+	if !ok {
+		return fmt.Errorf("unknown topic %q", c.Topic)
+	}
+	if int(c.Partition) >= len(t.Partitions) {
+		return fmt.Errorf("unknown partition %d of topic %q", c.Partition, c.Topic)
+	}
+	p := t.Partitions[c.Partition]
+	if p.NodeID == c.NodeID {
+		return p // already the leader: a harmless no-op
+	}
+	idx := -1
+	for i, r := range p.Replicas {
+		if r == c.NodeID {
+			idx = i
+			break
+		}
+	}
+	if idx < 0 {
+		return fmt.Errorf("node %q is not a replica of %s/%d", c.NodeID, c.Topic, c.Partition)
+	}
+	newReplicas := make([]string, 0, len(p.Replicas)-1)
+	for _, r := range p.Replicas {
+		if r != c.NodeID {
+			newReplicas = append(newReplicas, r)
+		}
+	}
+	t.Partitions[c.Partition] = PartitionAssignment{Partition: c.Partition, NodeID: c.NodeID, Replicas: newReplicas}
+	f.topics[c.Topic] = t
+	return t.Partitions[c.Partition]
 }
 
 // Nodes is a direct (non-Raft-log) read of this node's current membership:
