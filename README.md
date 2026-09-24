@@ -236,9 +236,14 @@ Brings up `n1`, `n2`, `n3` on a compose network, each bootstrapped with
 the same static 3-node configuration. gRPC control planes are published on
 `localhost:8001`, `8002`, `8003`.
 
-**Not yet verified end to end:** the image builds, but Docker Desktop's engine
-would not start in the environment this was developed in, so `up` has never
-been run. The Raft behaviour it would demo is what the `go test` below proves.
+**Verified end to end, for real:** `docker compose up --build` was run in this
+environment (Docker Desktop couldn't start earlier in development, but did
+here) -- three real containers came up, elected a leader independently (no
+fixed "first node wins"), and `CreateTopic` sent to a non-leader container
+correctly redirected while the leader accepted it and replicated the topic to
+all three via Raft, checked with real gRPC `ClusterState` calls against each
+container's published port. Torn down cleanly afterward (`docker compose
+down`) -- nothing was left running.
 
 ### Locally (three processes, one machine)
 

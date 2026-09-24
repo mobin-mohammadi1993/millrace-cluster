@@ -1,5 +1,3 @@
-version: "3.9"
-
 # A real 3-node Raft cluster. Each node is the same image; only --node-id
 # and --raft-addr (bound to this container's own hostname, so peers can
 # dial it back over the compose network) differ. All three get the
